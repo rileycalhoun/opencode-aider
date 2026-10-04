@@ -19,20 +19,44 @@ Mapping notes, all observed live against opencode 1.18.33:
 - HOME isolation: the ACP process runs under an isolated HOME holding only
   auth.json. Ambient host config (MCP servers, plugins) otherwise leaks
   undeclared tools into every session.
+
+Hardening (each item traces to a verified audit finding, 2026-10-04):
+- Agent stderr is captured to a bounded ring and dumped on turn failure.
+  It used to go to DEVNULL, which blinded every diagnosis.
+- Dropped frames (sessionId miss, malformed lines, correlation miss) are
+  logged with counters instead of vanishing silently.
+- Leaked per-turn waiters are cancelled; GeneratorExit closes the session
+  promptly instead of orphaning it.
+- Session queues are woken on process death so turns fail fast instead of
+  hanging to the idle timeout.
+- Idle timeout message matches the retry classifier, so one transient stall
+  retries instead of failing once and permanently.
+- usage_update frames are logged at 50K-token steps: a progress heartbeat
+  that distinguishes reasoning-in-progress from dead air.
+- The shared process recycles after MAX_TURNS_PER_PROC turns (only when no
+  turn is active), bounding leaked server-side session state.
 """
 import asyncio
+import collections
 import json
 import os
 
 OPENCODE_BIN = os.environ.get("OPENCODE_CLI", "/usr/local/bin/opencode")
 ACP_HOME = "/home/opencode/.cache/acp-home"
 ACP_AUTH_SRC = "/home/opencode/.local/share/opencode/auth.json"
-IDLE_TIMEOUT = 300  # mirrors old PER_READ_TIMEOUT: abort a silent turn
+IDLE_TIMEOUT = 300  # abort a turn silent this long (matches retry classifier)
 TURN_TIMEOUT = 1200  # hard ceiling per turn (20 min)
+MAX_TURNS_PER_PROC = 25  # recycle the shared proc past this many turns
+STDERR_RING = 200  # agent stderr lines kept for failure dumps
+USAGE_LOG_STEP = 50000  # log a heartbeat every this many tokens
 
 
 class AcpError(Exception):
     pass
+
+
+def _log(msg):
+    print("[acp] %s" % msg, flush=True)
 
 
 def ensure_acp_home():
@@ -62,38 +86,90 @@ class AcpProcess:
     def __init__(self):
         self.proc = None
         self._write_lock = None
+        self._spawn_lock = None
         self._pending = {}
         self._sessions = {}
         self._id_seq = 0
+        self._turns = 0
+        self._active = 0
+        self._stderr_ring = collections.deque(maxlen=STDERR_RING)
+        self._drop_session = 0
+        self._drop_parse = 0
+        self._drop_correlate = 0
 
     def _ensure_loop_primitives(self):
         if self._write_lock is None:
             self._write_lock = asyncio.Lock()
+        if self._spawn_lock is None:
+            self._spawn_lock = asyncio.Lock()
 
     async def ensure_alive(self):
         self._ensure_loop_primitives()
-        if self.proc is not None and self.proc.returncode is None:
+        async with self._spawn_lock:
+            if self.proc is not None and self.proc.returncode is None:
+                if self._turns >= MAX_TURNS_PER_PROC and self._active == 0:
+                    _log("recycling ACP proc after %d turns" % self._turns)
+                    await self._terminate_proc()
+                else:
+                    return
+            ensure_acp_home()
+            env = dict(os.environ)
+            env["HOME"] = ACP_HOME
+            self.proc = await asyncio.create_subprocess_exec(
+                OPENCODE_BIN, "acp",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=ACP_HOME, env=env,
+                limit=4 * 1024 * 1024,
+            )
+            self._pending = {}
+            self._sessions = {}
+            self._turns = 0
+            self._stderr_ring.clear()
+            _log("ACP proc spawned pid=%s" % self.proc.pid)
+            asyncio.ensure_future(self._reader_loop())
+            asyncio.ensure_future(self._stderr_loop())
+
+    async def _terminate_proc(self):
+        proc, self.proc = self.proc, None
+        if proc is None or proc.returncode is not None:
             return
-        ensure_acp_home()
-        env = dict(os.environ)
-        env["HOME"] = ACP_HOME
-        self.proc = await asyncio.create_subprocess_exec(
-            OPENCODE_BIN, "acp",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            cwd=ACP_HOME, env=env,
-            limit=4 * 1024 * 1024,
-        )
-        self._pending = {}
-        self._sessions = {}
-        asyncio.ensure_future(self._reader_loop())
+        try:
+            proc.terminate()
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     def _fail_all(self, err):
         for fut in list(self._pending.values()):
             if not fut.done():
                 fut.set_exception(err)
         self._pending = {}
+        dead = {"__acp_dead__": True}
+        for q in list(self._sessions.values()):
+            try:
+                q.put_nowait(dead)
+            except Exception:
+                pass
+
+    async def _stderr_loop(self):
+        try:
+            while True:
+                line = await self.proc.stderr.readline()
+                if not line:
+                    break
+                self._stderr_ring.append(
+                    line.decode("utf-8", "replace").rstrip()[:300])
+        except Exception:
+            pass
+
+    def dump_stderr(self, tail=15):
+        lines = list(self._stderr_ring)[-tail:]
+        return lines if lines else ["(agent stderr empty)"]
 
     async def _reader_loop(self):
         try:
@@ -104,10 +180,13 @@ class AcpProcess:
                 try:
                     obj = json.loads(line.decode("utf-8", "replace"))
                 except Exception:
+                    self._drop_parse += 1
+                    _log("dropped malformed stdout line (total %d)"
+                         % self._drop_parse)
                     continue
                 await self._dispatch(obj)
-        except Exception:
-            pass
+        except Exception as e:
+            _log("reader loop ended: %s" % e)
         finally:
             self._fail_all(AcpError("acp process died"))
             self.proc = None
@@ -119,14 +198,24 @@ class AcpProcess:
             fut = self._pending.pop(obj["id"], None)
             if fut is not None and not fut.done():
                 fut.set_result(obj)
+            else:
+                self._drop_correlate += 1
+                _log("dropped response with no waiter "
+                     "(total %d): %s" % (self._drop_correlate,
+                                        json.dumps(obj)[:160]))
             return
         params = obj.get("params") or {}
         if obj.get("method") == "session/update":
             q = self._sessions.get(params.get("sessionId"))
             if q is not None:
                 await q.put(params.get("update") or {})
+            else:
+                self._drop_session += 1
+                _log("dropped update for unknown session "
+                     "(total %d)" % self._drop_session)
             return
         if "id" in obj and obj.get("method"):
+            _log("denying unexpected inbound %s" % obj.get("method"))
             await self._send_raw({
                 "jsonrpc": "2.0", "id": obj["id"],
                 "error": {"code": -32601,
@@ -168,60 +257,80 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME):
     """Yield ('text', delta) | ('alien_tool', name) for one model turn."""
     acp = _ACP
     await acp.ensure_alive()
-
-    resp = await acp.request("session/new",
-                             {"cwd": workdir, "mcpServers": []})
-    sid = (resp.get("result") or {}).get("sessionId")
-    if not sid:
-        raise AcpError("session/new gave no sessionId: %s"
-                       % json.dumps(resp)[:200])
+    acp._active += 1
+    acp._turns += 1
+    last_usage_logged = 0
     try:
-        await acp.request("session/set_config_option",
-                          {"sessionId": sid, "configId": "model",
-                           "value": "opencode/" + model})
-        updates = acp.session_queue(sid)
-        prompt_task = asyncio.ensure_future(acp.request(
-            "session/prompt",
-            {"sessionId": sid, "prompt": [
-                {"type": "text", "text": prompt_text}]},
-            timeout=TURN_TIMEOUT))
-        pending_get = asyncio.ensure_future(updates.get())
+        resp = await acp.request("session/new",
+                                 {"cwd": workdir, "mcpServers": []})
+        sid = (resp.get("result") or {}).get("sessionId")
+        if not sid:
+            raise AcpError("session/new gave no sessionId: %s"
+                           % json.dumps(resp)[:200])
         try:
-            while True:
-                done, _ = await asyncio.wait(
-                    [pending_get, prompt_task],
-                    return_when=asyncio.FIRST_COMPLETED,
-                    timeout=IDLE_TIMEOUT)
-                if not done:
-                    raise AcpError("acp turn idle too long")
-                if prompt_task in done:
-                    try:
-                        resp = prompt_task.result()
-                    except Exception as e:
-                        raise AcpError("prompt failed: %s" % e)
-                    if isinstance(resp, dict) and resp.get("error"):
-                        raise AcpError("prompt refused: %s"
-                                       % json.dumps(resp["error"])[:200])
-                    return
-                update = pending_get.result()
-                pending_get = asyncio.ensure_future(updates.get())
-                kind = update.get("sessionUpdate")
-                if kind == "agent_message_chunk":
-                    content = update.get("content") or {}
-                    if (content.get("type") == "text"
-                            and content.get("text")):
-                        yield ("text", content["text"])
-                elif kind in ("tool_call", "tool_call_update"):
-                    yield ("alien_tool",
-                           update.get("title") or "unknown")
-                # ignore: available_commands_update, usage_update, etc.
-        finally:
-            if not prompt_task.done():
-                prompt_task.cancel()
+            await acp.request("session/set_config_option",
+                              {"sessionId": sid, "configId": "model",
+                               "value": "opencode/" + model})
+            updates = acp.session_queue(sid)
+            prompt_task = asyncio.ensure_future(acp.request(
+                "session/prompt",
+                {"sessionId": sid, "prompt": [
+                    {"type": "text", "text": prompt_text}]},
+                timeout=TURN_TIMEOUT))
+            pending_get = asyncio.ensure_future(updates.get())
             try:
-                await acp.request("session/close", {"sessionId": sid},
-                                  timeout=10)
-            except Exception:
-                pass
+                while True:
+                    done, _ = await asyncio.wait(
+                        [pending_get, prompt_task],
+                        return_when=asyncio.FIRST_COMPLETED,
+                        timeout=IDLE_TIMEOUT)
+                    if not done:
+                        raise AcpError(
+                            "acp turn timeout: idle too long without frames")
+                    if prompt_task in done:
+                        try:
+                            resp = prompt_task.result()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            raise AcpError("prompt failed: %s" % e)
+                        if isinstance(resp, dict) and resp.get("error"):
+                            raise AcpError("prompt refused: %s"
+                                           % json.dumps(resp["error"])[:200])
+                        return
+                    update = pending_get.result()
+                    pending_get = asyncio.ensure_future(updates.get())
+                    if isinstance(update, dict) and update.get("__acp_dead__"):
+                        raise AcpError("acp process died mid-turn (aborted)")
+                    kind = update.get("sessionUpdate")
+                    if kind == "agent_message_chunk":
+                        content = update.get("content") or {}
+                        if (content.get("type") == "text"
+                                and content.get("text")):
+                            yield ("text", content["text"])
+                    elif kind in ("tool_call", "tool_call_update"):
+                        yield ("alien_tool",
+                               update.get("title") or "unknown")
+                    elif kind == "usage_update":
+                        try:
+                            used = int(update.get("used") or 0)
+                        except Exception:
+                            used = 0
+                        if used - last_usage_logged >= USAGE_LOG_STEP:
+                            last_usage_logged = used
+                            _log("turn progress: %dk tokens so far" % (used // 1000))
+                    # ignore: available_commands_update, etc.
+            finally:
+                if not pending_get.done():
+                    pending_get.cancel()
+                if not prompt_task.done():
+                    prompt_task.cancel()
+                try:
+                    await acp.request("session/close", {"sessionId": sid},
+                                      timeout=10)
+                except Exception:
+                    pass
+        finally:
+            acp.forget_session(sid)
     finally:
-        acp.forget_session(sid)
+        acp._active -= 1
