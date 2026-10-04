@@ -30,20 +30,14 @@ Two hard problems this solves, both verified empirically (2026-09-28):
 """
 
 import asyncio, json, os, uuid, argparse, re, time
+from acp_transport import AcpError, acp_turn_events
 from aiohttp import web
 
 OPENCODE_CLI = os.environ.get(
     "OPENCODE_CLI", "/usr/local/bin/opencode"
 )
-# The CLI's own built-in tools (bash/read/write) cannot be disabled in this
-# build and --auto approves their permission prompts. Keep its cwd in a throw-
-# away scratch dir so an alien tool can never touch real user files; the client
-# tool calls all use absolute paths anyway.
-WORK_DIR = os.environ.get(
-    "OC_SHIM_CWD", "/home/opencode/.cache/oc-shim-cwd"
-)
-os.makedirs(WORK_DIR, exist_ok=True)
-PER_READ_TIMEOUT = 300
+# Alien tool containment now comes from the ACP isolated HOME
+# (see acp_transport.ensure_acp_home), not a scratch cwd.
 # Transient CLI failures worth a retry: the step watchdog aborts (often after a
 # permission prompt stalled), read timeouts, connection resets.
 TRANSIENT_RE = re.compile(r"interrupt|abort|timeout|econn|reset|timed out", re.I)
@@ -140,18 +134,6 @@ def allow_model(requested):
     if model not in FREE_MODELS:
         return False, model
     return True, model
-
-
-def cli_env():
-    """Subprocess env with a native PWD.
-
-    opencode-cli.exe chdir()s to $PWD. Under Git-Bash/MSYS that is a POSIX path
-    ('/c/Users/...') the Windows binary cannot chdir into, and every call dies
-    with 'Failed to change directory to /c/Users/...'.
-    """
-    env = dict(os.environ)
-    env["PWD"] = WORK_DIR
-    return env
 
 
 # ── tool catalogue ───────────────────────────────────────────────────────────
@@ -384,73 +366,10 @@ class ShimError(Exception):
     pass
 
 
-async def run_opencode(model, prompt):
-    """Yield events: ('text', delta) | ('tool', raw) | ('alien_tool', name).
-
-    The prompt is written to STDIN, never argv (WinError 206).
-    """
-    cmd = [OPENCODE_CLI, "run", "--format", "json", "--auto",
-           "--model", "opencode/" + model]
-    # The CLI emits each JSON event as ONE line containing the FULL response
-    # text accumulated so far, so a long turn easily exceeds asyncio's default
-    # 64 KiB StreamReader limit and readline() dies with LimitOverrunError
-    # ("Separator is found, but chunk is longer than limit"). Prompts here
-    # routinely approach 1 MiB, so the pipe buffer is sized accordingly.
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE, cwd=WORK_DIR, env=cli_env(),
-        limit=16 * 1024 * 1024,
-    )
-    try:
-        proc.stdin.write(prompt.encode("utf-8"))
-        await proc.stdin.drain()
-        proc.stdin.close()
-    except (BrokenPipeError, ConnectionResetError):
-        pass
-
-    sent = ""
-
-    async def pump():
-        nonlocal sent
-        while True:
-            line = await asyncio.wait_for(proc.stdout.readline(), timeout=PER_READ_TIMEOUT)
-            if not line:
-                break
-            line = line.decode("utf-8", "replace").strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            t = obj.get("type")
-            if t == "error":
-                err = obj.get("error", {})
-                raise ShimError(f"{err.get('type', 'error')}: {err.get('message', '?')}")
-            if t == "tool_use":
-                # OpenCode's own tools. Not client tools - suppress.
-                yield ("alien_tool", (obj.get("part") or {}).get("tool", "?"))
-            elif t == "text":
-                part = obj.get("part", {})
-                new = part.get("text", obj.get("text", ""))
-                if new and len(new) > len(sent):
-                    yield ("text", new[len(sent):])
-                    sent = new
-        rc = await proc.wait()
-        if rc != 0:
-            err = (await proc.stderr.read()).decode("utf-8", "replace")[-500:]
-            raise ShimError(f"opencode exit {rc}: {err}")
-
-    try:
-        async for ev in pump():
-            yield ev
-    except Exception:
-        if proc.returncode is None:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-        raise
+# ACP transport lives in acp_transport.py (multiplexed sessions on one
+# long-lived `opencode acp` process, streaming agent_message_chunk
+# deltas live). The per-turn subprocess pump it replaces is gone;
+# collect() below is unchanged apart from its event source.
 
 
 async def collect(model, prompt, stream_cb=None, log=None):
@@ -482,7 +401,7 @@ async def collect(model, prompt, stream_cb=None, log=None):
         text_parts, tool_raw = [], []
         alien = []
         try:
-            async for ev, payload in run_opencode(model, prompt):
+            async for ev, payload in acp_turn_events(model, prompt):
                 if ev == "text":
                     for kind, seg in sp.feed(payload):
                         if kind == "text":
@@ -494,10 +413,10 @@ async def collect(model, prompt, stream_cb=None, log=None):
                             tool_raw.append(seg)
                 elif ev == "alien_tool":
                     alien.append(payload)
-        except ShimError as e:
+        except (ShimError, AcpError) as e:
             if attempt < 2 and TRANSIENT_RE.search(str(e)):
                 if stream_cb:
-                    await stream_cb(f"\n[shim: CLI died ({e}); retrying turn]\n")
+                    await stream_cb(f"\n[shim: turn transport failed ({e}); retrying turn]\n")
                 continue
             raise
         for kind, seg in sp.flush():
@@ -733,7 +652,7 @@ def main():
     app.router.add_get("/v1/models", handle_models)
     app.router.add_post("/v1/chat/completions", handle_chat)
     app.router.add_post("/chat/completions", handle_chat)
-    print(f"[proxy] streaming :{args.port} -> {WORK_DIR}", flush=True)
+    print(f"[proxy] streaming :{args.port} (ACP transport)", flush=True)
     print(f"[proxy] cli exists: {os.path.exists(OPENCODE_CLI)}", flush=True)
     host = os.environ.get("OC_SHIM_HOST", "127.0.0.1")
     web.run_app(app, host=host, port=args.port)
