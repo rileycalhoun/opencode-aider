@@ -3,7 +3,7 @@ tool-block parsing, and the WinError-206 length path. No network."""
 import importlib.util, json, sys, os
 
 spec = importlib.util.spec_from_file_location(
-    "p4", r"C:\Users\User\Documents\Shim_v2\opencode_proxy.py")
+    "p4", os.path.join(os.path.dirname(os.path.abspath(__file__)), "opencode_proxy.py"))
 p4 = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(p4)
 
@@ -50,8 +50,8 @@ for size in (1, 3, 7, 100):
        not any(k == "tool" for k, _ in got))
 
 print("=== splitter: literal '<' and near-miss fences ===")
-for payload in ["a < b", "x <hermes_tool_c", "no fence </hermes_tool_call> here",
-                "<<hermes_tool_call>>"]:
+for payload in ["a < b", "x <hermes_tool_c", "no fence </tool_call> here",
+                "<<tool_call>>"]:
     chunks = [payload[i:i+2] for i in range(0, len(payload), 2)]
     got = split_all(chunks)
     txt = "".join(s for k, s in got if k == "text")
@@ -103,7 +103,7 @@ body = {
 }
 pr = p4.build_prompt(body)
 for needle in ["You are Hermes.", "list files", "[tool call: terminal]", "a.txt",
-               "now delete them", "## terminal", "command", "hermes_tool_call"]:
+               "now delete them", "## terminal", "command", "tool_call"]:
     ok(f"prompt carries {needle[:28]!r}", needle in pr)
 
 print("=== WinError 206: prompt far past the 32,767 argv cap ===")

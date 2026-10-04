@@ -15,15 +15,15 @@ Two hard problems this solves, both verified empirically (2026-09-28):
 
 2. Tool calling.
    The shim used to drop the OpenAI `tools` array entirely, so models behind it
-   could not drive Hermes tools and would hallucinate results. The full tool
+   could not drive client tools and would hallucinate results. The full tool
    catalogue is now serialised into the prompt, the model emits a fenced
    tool-call block, and the shim parses it back into real OpenAI `tool_calls`
-   frames. Hermes executes the tools; the shim never does.
+   frames. The client executes the tools; the shim never does.
 
-   The CLI injects its OWN tools (bash/read/write) that do not exist in Hermes
+   The CLI injects its OWN tools (bash/read/write) that do not exist in the client
    and cannot be disabled in this build (custom agent definitions in
    opencode.json / agent/*.md are not loaded by opencode-cli 2.0.11). Those
-   `tool_use` events are therefore SUPPRESSED: never forwarded to Hermes, and
+   `tool_use` events are therefore SUPPRESSED: never forwarded to the client, and
    the model is told up front it has no built-in tools. If it reaches for one
    anyway, the shim injects a corrective nudge instead of leaking an alien
    tool call.
@@ -32,14 +32,16 @@ Two hard problems this solves, both verified empirically (2026-09-28):
 import asyncio, json, os, uuid, argparse, re
 from aiohttp import web
 
-OPENCODE_CLI = os.path.expandvars(
-    r"%APPDATA%\ai.opencode.desktop\cli\2.0.11\opencode-cli.exe"
+OPENCODE_CLI = os.environ.get(
+    "OPENCODE_CLI", "/usr/local/bin/opencode"
 )
 # The CLI's own built-in tools (bash/read/write) cannot be disabled in this
 # build and --auto approves their permission prompts. Keep its cwd in a throw-
-# away scratch dir so an alien tool can never touch real user files; Hermes
+# away scratch dir so an alien tool can never touch real user files; the client
 # tool calls all use absolute paths anyway.
-WORK_DIR = os.path.expandvars(r"%LOCALAPPDATA%\Temp\oc_shim_cwd")
+WORK_DIR = os.environ.get(
+    "OC_SHIM_CWD", "/home/opencode/.cache/oc-shim-cwd"
+)
 os.makedirs(WORK_DIR, exist_ok=True)
 PER_READ_TIMEOUT = 300
 # Transient CLI failures worth a retry: the step watchdog aborts (often after a
@@ -54,6 +56,7 @@ FREE_MODELS = [
     "ling-3.0-flash-fin-free",
     "nemotron-3-ultra-free",
     "nemotron-3.5-lightning-free",
+    "muse-spark-1.3-contributor-free",
 ]
 DEAD_MODELS = {
     "mimo-v2.5-free": "Model retired by OpenCode (provider.no-route).",
@@ -65,10 +68,13 @@ ALIASES = {
     "bunny": "space-bunny-free", "space-bunny": "space-bunny-free",
     "mimo": "mimo-v2.6-flash-free", "ling": "ling-3.0-flash-fin-free",
     "nemotron": "nemotron-3-ultra-free", "nemotron-3-ultra": "nemotron-3-ultra-free",
+    "muse-spark": "muse-spark-1.3-contributor-free",
+    "muse-spark-1.3": "muse-spark-1.3-contributor-free",
+    "spark": "muse-spark-1.3-contributor-free",
 }
 
-OPEN_FENCE = "<hermes_tool_call>"
-CLOSE_FENCE = "</hermes_tool_call>"
+OPEN_FENCE = "<tool_call>"
+CLOSE_FENCE = "</tool_call>"
 
 PROTOCOL = """\
 # TOOL PROTOCOL (read carefully)
@@ -80,9 +86,9 @@ harness that executes them for you and returns the results.
 
 To call one or more tools, output ONLY this fenced block, with no other text:
 
-<hermes_tool_call>
+<tool_call>
 {"name": "TOOL_NAME", "arguments": {"KEY": "VALUE"}}
-</hermes_tool_call>
+</tool_call>
 
 Rules:
 - The block must be the entire response. No prose before or after it.
@@ -100,6 +106,18 @@ def resolve_model(name):
         if name.startswith(p):
             name = name[len(p):]
     return ALIASES.get(name.lower(), name)
+
+
+# Undertaker lockdown: only free-tier models may pass. Anything else returns
+# 404 without ever touching the CLI, so a caller can never spend paid Zen
+# credit through this proxy.
+def allow_model(requested):
+    model = resolve_model(requested)
+    if model in DEAD_MODELS:
+        return False, model
+    if model not in FREE_MODELS:
+        return False, model
+    return True, model
 
 
 def cli_env():
@@ -154,7 +172,7 @@ def _content_to_text(content):
 
 
 def flatten_history(msgs):
-    """Flatten the whole Hermes conversation into one prompt.
+    """Flatten the whole client conversation into one prompt.
 
     The CLI is a fresh process per call, so context must ride in the prompt.
     Tool calls and their results are labelled so the model can chain them.
@@ -187,13 +205,43 @@ def flatten_history(msgs):
     return "\n\n".join(lines).strip()
 
 
+def tool_choice_directive(body):
+    """Extra instruction when the caller constrains tool use.
+
+    Returns (render_catalogue, directive). The proxy previously ignored
+    tool_choice entirely, so a client demanding a specific function call
+    could get prose instead with no recourse.
+    """
+    tc = body.get("tool_choice")
+    if tc is None or tc == "auto":
+        return True, ""
+    if tc == "none":
+        return False, ""
+    name = None
+    if isinstance(tc, dict):
+        if tc.get("type") == "function":
+            fn = tc.get("function") or {}
+            name = fn.get("name")
+        else:
+            name = tc.get("name")
+    if not name:
+        return True, ""
+    return True, (
+        "[system] The caller requires a call to `%s` this turn. Respond "
+        "with ONLY the tool-call block for that tool, no prose before or "
+        "after it." % name)
+
+
 def build_prompt(body):
     msgs = body.get("messages", [])
     tools = body.get("tools") or []
+    render_catalogue, directive = tool_choice_directive(body)
     parts = []
-    if tools:
+    if tools and render_catalogue:
         parts.append(PROTOCOL)
         parts.append(render_tools(tools))
+    if directive:
+        parts.append(directive)
     convo = flatten_history(msgs)
     parts.append(convo if convo else "Hello")
     return "\n\n".join(p for p in parts if p)
@@ -352,7 +400,7 @@ async def run_opencode(model, prompt):
                 err = obj.get("error", {})
                 raise ShimError(f"{err.get('type', 'error')}: {err.get('message', '?')}")
             if t == "tool_use":
-                # OpenCode's own tools. Not Hermes tools - suppress.
+                # OpenCode's own tools. Not client tools - suppress.
                 yield ("alien_tool", (obj.get("part") or {}).get("tool", "?"))
             elif t == "text":
                 part = obj.get("part", {})
@@ -384,7 +432,7 @@ async def collect(model, prompt, stream_cb=None):
     once with a corrective nudge appended to the prompt. Transient CLI deaths
     (step watchdog abort, timeout, connection reset) are also retried: without
     this the partial text of a killed turn is masked as a complete answer and
-    Hermes sees the turn 'finish' with no tool calls.
+    the client sees the turn 'finish' with no tool calls.
     """
     alien = []
     for attempt in range(3):
@@ -420,7 +468,7 @@ async def collect(model, prompt, stream_cb=None):
         calls = parse_tool_block("".join(tool_raw))
         if calls or not alien or attempt == 2:
             return "".join(text_parts), calls, alien
-        # The model tried a tool that does not exist in Hermes. Correct it.
+        # The model tried a tool that does not exist in the client. Correct it.
         prompt = (prompt + "\n\n[system] Your last attempt tried to use a built-in "
                   "tool (" + ", ".join(sorted(set(alien))) + "). That tool does not "
                   "exist here and its output is discarded. Use the tool protocol "
@@ -478,10 +526,15 @@ async def handle_chat(request):
 
     requested = body.get("model") or DEFAULT_MODEL
     model = resolve_model(requested)
-    if model in DEAD_MODELS:
+    ok, model = allow_model(requested)
+    if not ok:
+        if model in DEAD_MODELS:
+            msg, code = DEAD_MODELS[model], "model_dead"
+        else:
+            msg, code = ("model '%s' is not served by this proxy; free-tier models only" % requested, "model_not_found")
         return web.json_response(
-            {"error": {"message": DEAD_MODELS[model], "type": "model_not_found",
-                       "code": "model_dead", "param": "model"}}, status=503)
+            {"error": {"message": msg, "type": "model_not_found",
+                       "code": code, "param": "model"}}, status=404)
 
     stream = bool(body.get("stream"))
     ntools = len(body.get("tools") or [])
@@ -564,7 +617,8 @@ def main():
     app.router.add_post("/chat/completions", handle_chat)
     print(f"[proxy] streaming :{args.port} -> {WORK_DIR}", flush=True)
     print(f"[proxy] cli exists: {os.path.exists(OPENCODE_CLI)}", flush=True)
-    web.run_app(app, host="127.0.0.1", port=args.port)
+    host = os.environ.get("OC_SHIM_HOST", "127.0.0.1")
+    web.run_app(app, host=host, port=args.port)
 
 
 if __name__ == "__main__":
