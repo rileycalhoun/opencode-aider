@@ -369,9 +369,15 @@ async def run_opencode(model, prompt):
     """
     cmd = [OPENCODE_CLI, "run", "--format", "json", "--auto",
            "--model", "opencode/" + model]
+    # The CLI emits each JSON event as ONE line containing the FULL response
+    # text accumulated so far, so a long turn easily exceeds asyncio's default
+    # 64 KiB StreamReader limit and readline() dies with LimitOverrunError
+    # ("Separator is found, but chunk is longer than limit"). Prompts here
+    # routinely approach 1 MiB, so the pipe buffer is sized accordingly.
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE, cwd=WORK_DIR, env=cli_env(),
+        limit=16 * 1024 * 1024,
     )
     try:
         proc.stdin.write(prompt.encode("utf-8"))
