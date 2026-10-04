@@ -73,6 +73,28 @@ ALIASES = {
     "spark": "muse-spark-1.3-contributor-free",
 }
 
+ZEN_API_URL = "https://opencode.ai/zen/v1"
+ZEN_KEY_FILE = "/home/opencode/.local/share/opencode/auth.json"
+
+# Free models verified to serve over bare HTTPS with the account key (live
+# probe, not docs). Everything else in FREE_MODELS needs the CLI transport.
+DIRECT_MODELS = {
+    "space-bunny-free",
+}
+
+
+def load_zen_key():
+    """Account API key for direct calls. Same user, same 0600 file the CLI
+    itself reads; never logged, never echoed. Returns None when unavailable,
+    in which case the direct route reports disabled instead of failing oddly."""
+    try:
+        import json as _json
+        with open(ZEN_KEY_FILE) as _f:
+            return _json.load(_f)["opencode"]["key"]
+    except Exception:
+        return None
+
+
 OPEN_FENCE = "<tool_call>"
 CLOSE_FENCE = "</tool_call>"
 
@@ -545,6 +567,64 @@ def final_body(cid, model, text, calls):
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
 
 
+# ── direct Zen passthrough ───────────────────────────
+
+async def handle_direct(request, body, model):
+    """Relay to the Zen OpenAI-compatible endpoint untouched.
+
+    Tools, tool_choice, temperature, max_tokens and every other OpenAI field
+    pass through verbatim: tool calling is native here, so none of the fenced
+    text protocol applies. Streaming chunks are forwarded byte-for-byte as
+    they arrive (810 chunks over 37s measured), which is the true incremental
+    streaming the CLI transport cannot provide.
+    """
+    import aiohttp as _aiohttp
+    key = load_zen_key()
+    if not key:
+        return web.json_response(
+            {"error": {"message": "direct route unavailable: account key unreadable",
+                       "type": "server_error", "code": "no_key"}}, status=503)
+    headers = {"Content-Type": "application/json",
+               "Authorization": "Bearer " + key}
+    timeout = _aiohttp.ClientTimeout(total=600, sock_read=300)
+    try:
+        session = _aiohttp.ClientSession(timeout=timeout)
+        upstream = await session.post(
+            ZEN_API_URL + "/chat/completions",
+            headers=headers, json=body)
+    except Exception as e:
+        return web.json_response(
+            {"error": {"message": "zen unreachable: %s" % e,
+                       "type": "server_error"}}, status=502)
+    if body.get("stream"):
+        resp = web.StreamResponse(status=upstream.status, headers={
+            "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
+            "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+        await resp.prepare(request)
+        try:
+            async for chunk_bytes in upstream.content.iter_any():
+                if chunk_bytes:
+                    await resp.write(chunk_bytes)
+            await resp.write_eof()
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
+        finally:
+            await upstream.release()
+            await session.close()
+        print("[proxy] direct %s streamed done" % model, flush=True)
+        return resp
+    try:
+        payload = await upstream.json()
+    except Exception as e:
+        return web.json_response(
+            {"error": {"message": "zen bad reply: %s" % e,
+                       "type": "server_error"}}, status=502)
+    finally:
+        await upstream.release()
+        await session.close()
+    return web.json_response(payload, status=upstream.status)
+
+
 # ── handlers ─────────────────────────────────────────────────────────────────
 
 async def handle_chat(request):
@@ -565,6 +645,11 @@ async def handle_chat(request):
             {"error": {"message": msg, "type": "model_not_found",
                        "code": code, "param": "model"}}, status=404)
 
+    if model in DIRECT_MODELS:
+        print("[proxy] %s direct %s tools=%d" % (
+            model, "stream" if body.get("stream") else "block",
+            len(body.get("tools") or [])), flush=True)
+        return await handle_direct(request, body, model)
     stream = bool(body.get("stream"))
     ntools = len(body.get("tools") or [])
     prompt = build_prompt(body)
