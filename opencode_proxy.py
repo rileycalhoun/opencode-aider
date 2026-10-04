@@ -481,6 +481,13 @@ async def collect(model, prompt, stream_cb=None):
 def chunk(cid, model, delta=None, finish=None):
     d = {}
     if delta is not None:
+        # The OpenAI wire format requires delta to be an OBJECT. A bare
+        # string here passes Python fine but explodes client-side schema
+        # validation (Vercel AI SDK zod: "expected object, received string"),
+        # turning a readable proxy error into an inscrutable union error.
+        # Coerce once, centrally, so no error path can emit a bad frame.
+        if isinstance(delta, str):
+            delta = {"content": delta}
         d["delta"] = delta
     if finish:
         d["finish_reason"] = finish
