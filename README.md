@@ -5,11 +5,17 @@ An OpenAI-compatible SSE proxy that serves OpenCode's free-tier models to
 
 Most of OpenCode free tier is locked behind desktop-app identity: bare
 HTTP requests get rejected (403), so this proxy drives the authenticated
-`opencode` CLI (custom per-call JSON protocol) and translates its output to
-OpenAI SSE. One model is the exception: `space-bunny-free` serves over bare
-HTTPS with the account key, so requests for it skip the CLI entirely and
+`opencode` CLI and translates its output to OpenAI SSE. Two transports,
+routed per model automatically. `space-bunny-free` serves over bare HTTPS
+with the account key, so requests for it skip local processes entirely and
 relay natively -- true incremental streaming plus native `tool_calls`, no
-fence protocol involved. The proxy routes per model automatically.
+fence protocol involved. Every other free model goes over ACP: one
+long-lived `opencode acp` process hosts multiplexed sessions (one per HTTP
+turn), `session/set_config_option` selects the model, and
+`agent_message_chunk` deltas relay live as SSE -- genuine incremental
+streaming, verified at 301 chunks over 8 seconds. Client tools still travel
+as a fenced text protocol parsed back into `tool_calls`; opencode-native
+tool calls are suppressed exactly as before.
 
 Forked from
 [ArcticWinterSturm/opencode-compat-shim](https://github.com/ArcticWinterSturm/opencode-compat-shim)
