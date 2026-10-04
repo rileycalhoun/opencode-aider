@@ -3,12 +3,13 @@
 An OpenAI-compatible SSE proxy that serves OpenCode's free-tier models to
 **Aider**, **AiderDesk**, and any other OpenAI-compatible client.
 
-OpenCode locks its free tier behind desktop-app identity: bare HTTP requests
-get rejected (403). The only authenticated transport is the `opencode` CLI,
-which speaks a custom per-call JSON protocol instead of OpenAI's SSE wire
-format. This proxy translates between the two: it accepts standard
-`/v1/chat/completions` requests (including `tools`, `tool_choice`, and
-streaming) and fulfills them by driving the CLI with the prompt over stdin.
+Most of OpenCode free tier is locked behind desktop-app identity: bare
+HTTP requests get rejected (403), so this proxy drives the authenticated
+`opencode` CLI (custom per-call JSON protocol) and translates its output to
+OpenAI SSE. One model is the exception: `space-bunny-free` serves over bare
+HTTPS with the account key, so requests for it skip the CLI entirely and
+relay natively -- true incremental streaming plus native `tool_calls`, no
+fence protocol involved. The proxy routes per model automatically.
 
 Forked from
 [ArcticWinterSturm/opencode-compat-shim](https://github.com/ArcticWinterSturm/opencode-compat-shim)
