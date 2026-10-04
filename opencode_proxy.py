@@ -431,15 +431,29 @@ async def run_opencode(model, prompt):
         raise
 
 
-async def collect(model, prompt, stream_cb=None):
+async def collect(model, prompt, stream_cb=None, log=None):
     """Run one turn. Returns (text, tool_calls, alien_tool_names).
 
-    If the model reached for one of the CLI's own tools, the turn is retried
-    once with a corrective nudge appended to the prompt. Transient CLI deaths
-    (step watchdog abort, timeout, connection reset) are also retried: without
-    this the partial text of a killed turn is masked as a complete answer and
-    the client sees the turn 'finish' with no tool calls.
+    Logs time-to-first-text so a slow-prefill turn is distinguishable from a
+    wedged one: previously the only log lines were turn start and turn end,
+    so minutes of legitimate model compute looked identical to a hang.
     """
+    t0 = time.monotonic()
+    first_at = None
+    def note_text():
+        nonlocal first_at
+        if first_at is None:
+            first_at = time.monotonic() - t0
+            if log:
+                log("first text after %.1fs" % first_at)
+
+    # NOTE (was docstring tail, kept as comment during repair):
+    # If the model reached for one of the CLI's own tools, the turn is retried
+    # once with a corrective nudge appended to the prompt. Transient CLI deaths
+    # (step watchdog abort, timeout, connection reset) are also retried: without
+    # this the partial text of a killed turn is masked as a complete answer and
+    # the client sees the turn 'finish' with no tool calls.
+
     alien = []
     for attempt in range(3):
         sp = Splitter()
@@ -451,6 +465,7 @@ async def collect(model, prompt, stream_cb=None):
                     for kind, seg in sp.feed(payload):
                         if kind == "text":
                             text_parts.append(seg)
+                            note_text()
                             if stream_cb:
                                 await stream_cb(seg)
                         else:
@@ -466,6 +481,7 @@ async def collect(model, prompt, stream_cb=None):
         for kind, seg in sp.flush():
             if kind == "text":
                 text_parts.append(seg)
+                note_text()
                 if stream_cb:
                     await stream_cb(seg)
             else:
@@ -558,7 +574,9 @@ async def handle_chat(request):
 
     if not stream:
         try:
-            text, calls, alien = await collect(model, prompt)
+            text, calls, alien = await collect(
+                model, prompt,
+                log=lambda m: print(f"[proxy] {cid} {m}", flush=True))
             return web.json_response(final_body(cid, model, text, calls))
         except Exception as e:
             print(f"[proxy] ERROR: {e}", flush=True)
@@ -578,7 +596,9 @@ async def handle_chat(request):
         async def on_text(seg):
             await send(chunk(cid, model, delta={"content": seg}))
 
-        text, calls, alien = await collect(model, prompt, stream_cb=on_text)
+        text, calls, alien = await collect(
+            model, prompt, stream_cb=on_text,
+            log=lambda m: print(f"[proxy] {cid} {m}", flush=True))
         for payload in tool_call_chunks(cid, model, calls):
             await send(payload)
         await send(chunk(cid, model, finish="tool_calls" if calls else "stop"))
