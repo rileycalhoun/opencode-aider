@@ -29,7 +29,7 @@ Two hard problems this solves, both verified empirically (2026-09-28):
    tool call.
 """
 
-import asyncio, json, os, uuid, argparse, re
+import asyncio, json, os, uuid, argparse, re, time
 from aiohttp import web
 
 OPENCODE_CLI = os.environ.get(
