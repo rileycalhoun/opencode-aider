@@ -31,7 +31,8 @@ Two hard problems this solves, both verified empirically (2026-09-28):
 
 import asyncio, json, os, uuid, argparse, re, time
 from acp_transport import (AcpError, TURN_TIMEOUT, acp_turn_events,
-    drop_affinity as _drop_affinity)
+    drop_affinity as _drop_affinity,
+    drop_if_idle as _drop_if_idle)
 from aiohttp import web
 
 OPENCODE_CLI = os.environ.get(
@@ -432,7 +433,7 @@ def parse_tool_block(raw):
             i = s.find("{")
             if i < 0:
                 break
-            if any(c in s[:i] for c in '{}":[]'):
+            if any(c in s[:i] for c in '{}"[]'):
                 print("[proxy] parse: stopping at structured text: %s"
                       % s[:i][:80], flush=True)
                 break
@@ -508,16 +509,18 @@ async def collect(model, prompt, stream_cb=None, log=None,
     so minutes of legitimate model compute looked identical to a hang.
     """
     t0 = time.monotonic()
-    try:
-        _offered_v, _forced_v, _mode_v = enforce
-        assert isinstance(_offered_v, list)
-        assert _mode_v in ("auto", "none", "required")
-    except Exception:
-        if enforce is not None:
-            print("[proxy] enforce contract invalid: auto fallback",
-                  flush=True)
-        _offered_v, _forced_v, _mode_v = [], None, "auto"
-    enforce = (_offered_v, _forced_v, _mode_v)
+    if enforce is None:
+        pass  # direct caller: no catalogue to enforce against
+    else:
+        try:
+            _offered_v, _forced_v, _mode_v = enforce
+            assert isinstance(_offered_v, list)
+            assert _mode_v in ("auto", "none", "required")
+            enforce = (_offered_v, _forced_v, _mode_v)
+        except Exception as _e:
+            print("[proxy] enforce contract invalid (%s): skipped"
+                  % _e, flush=True)
+            enforce = None
     first_at = None
     def note_text():
         nonlocal first_at
@@ -583,6 +586,8 @@ async def collect(model, prompt, stream_cb=None, log=None,
                 await gen.aclose()
             except Exception:
                 pass
+            if time.monotonic() < deadline - 1:
+                raise AcpError("prompt failed: transient timeout, retrying")
             raise AcpError("attempt exceeded remaining request budget")
         except (ShimError, AcpError) as e:
             msg = str(e)
@@ -594,6 +599,9 @@ async def collect(model, prompt, stream_cb=None, log=None,
                 for kind, seg in sp.flush():
                     if kind == "text":
                         text_parts.append(seg)
+                        note_text()
+                        if stream_cb:
+                            await stream_cb(seg)
                 if log:
                     log("alien with tools=0: returning prose")
                 return "".join(text_parts), [], [], attempt + 1
@@ -606,7 +614,7 @@ async def collect(model, prompt, stream_cb=None, log=None,
                           "a listed tool, or answer in plain text. Judge only "
                           "the final answer; prior attempts are superseded.")
                 corrected = True
-                _drop_affinity(affinity[0] if affinity else None)
+                _drop_if_idle(affinity[0] if affinity else None)
                 affinity = None  # fresh session, not a duplicate re-send
                 continue
             if attempt < 2 and TRANSIENT_RE.search(msg):
@@ -659,14 +667,14 @@ async def collect(model, prompt, stream_cb=None, log=None,
                       ". Plain prose is not acceptable. Judge only the "
                       "final answer; prior attempts are superseded.")
             corrected = True
-            _drop_affinity(affinity[0] if affinity else None)
+            _drop_if_idle(affinity[0] if affinity else None)
             affinity = None
             continue
         if _mode == "required" and not calls:
             raise ShimError("required tool %s produced no call"
                             % (_forced_name or "any"))
         if not calls and not alien and attempt < 2 and NARRATE_RE.search("".join(text_parts)):
-            _drop_affinity(affinity and affinity[0])
+            _drop_if_idle(affinity and affinity[0])
             # Model talked about the protocol instead of using it. Correct it.
             prompt = (prompt + "\n\n[system] Your last response talked about the tool "
                       "protocol instead of using it. Do not explain or narrate. Either "
@@ -779,21 +787,25 @@ async def handle_direct(request, body, model):
                 "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
                 "Connection": "keep-alive", "X-Accel-Buffering": "no"})
             await resp.prepare(request)
+            ok = True
             try:
                 async for chunk_bytes in upstream.content.iter_any():
                     if chunk_bytes:
                         await resp.write(chunk_bytes)
                 await resp.write_eof()
             except (ConnectionResetError, asyncio.CancelledError):
+                ok = False
                 pass
             except Exception as e:
+                ok = False
                 print("[proxy] direct stream error: %s" % e, flush=True)
                 try:
                     await resp.write_eof()
                 except Exception:
                     pass
             await upstream.release()
-            print("[proxy] direct %s streamed done" % model, flush=True)
+            if ok:
+                print("[proxy] direct %s streamed done" % model, flush=True)
             return resp
         try:
             payload = await upstream.json()
@@ -865,8 +877,11 @@ async def handle_chat(request):
         # Nothing new, or too much new: FRESH session with the full
         # prompt, under a REMAPPED key so the next turn doesn't repeat
         # this full resend against the old mapping.
-        _drop_affinity(_akey)
-        affinity = None
+        # Drop the old mapping and start a FRESH mapped session
+        # with the full prompt, so the NEXT turn resumes deltas
+        # instead of full-resending forever.
+        _drop_if_idle(_akey)
+        affinity = (_akey, "", len(_msgs), None, _store)
     else:
         _prior = flatten_history(_msgs[:_sent])
         _check = _hl3.sha1(_prior.encode()).hexdigest()[:16]
@@ -962,8 +977,8 @@ async def handle_chat(request):
             await resp.write_eof()
         except Exception:
             pass
-        finally:
-            await _stop_ka()
+    finally:
+        await _stop_ka()
     return resp
 
 

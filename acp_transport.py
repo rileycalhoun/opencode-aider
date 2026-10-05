@@ -304,7 +304,9 @@ def peek_sent(key):
 def mark_sent(key, sid, count, model, pfx=None):
     import time as _t
     prev = _AFFINITY.get(key)
-    if prev is not None and prev.get("sid") != sid and not prev.get("busy"):
+    if prev is not None and prev.get("sid") != sid:
+        if prev.get("busy"):
+            return False  # live turn owns this key: stay one-shot
         _orphan(prev["sid"])  # displaced idle mapping: close it
     idle_keys = [k for k in _AFFINITY
                  if k != key and not _AFFINITY[k].get("busy")]
@@ -317,6 +319,7 @@ def mark_sent(key, sid, count, model, pfx=None):
             _orphan(old["sid"])
     _AFFINITY[key] = {"sid": sid, "sent": count, "last": _t.monotonic(),
                       "busy": False, "model": model, "pfx": pfx}
+    return True
 
 
 def _orphan(sid):
@@ -328,6 +331,18 @@ def drop_affinity(key):
     e = _AFFINITY.pop(key, None)
     if e is not None:
         _orphan(e["sid"])
+
+
+def drop_if_idle(key):
+    """Drop a mapping only when no turn is running on it. A retry must
+    never orphan a session that is still live (its own retry racing, or
+    a concurrent twin). Returns True when dropped."""
+    e = _AFFINITY.get(key)
+    if e is None or e.get("busy"):
+        return False
+    _AFFINITY.pop(key, None)
+    _orphan(e["sid"])
+    return True
 
 
 async def reap_orphans(acp, limit=2):
@@ -408,6 +423,7 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
     sid = aff_entry["sid"] if shared else None
     ok = True
     abnormal = True  # safe default: early failure forgets session state
+    kept = False  # True only when a mapping is kept
     try:
         if not shared:
             # No MCP servers, ever: only fenced client tools exist here.
@@ -610,12 +626,14 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                                           timeout=10)
                     except Exception:
                         pass
-                elif aff_key is not None:
-                    # Healthy turn with a conversation key: keep the session,
-                    # record how many messages the server has seen.
-                    mark_sent(aff_key, sid, aff_count, model, aff_store)
+                elif aff_key is not None and mark_sent(
+                        aff_key, sid, aff_count, model, aff_store):
+                    # Healthy turn, mapping kept: session lives on.
+                    kept = True
                 else:
-                    # No key (direct collect callers): one-shot, close it.
+                    # No key, or the key is owned by a live twin turn:
+                    # one-shot close, no mapping.
+                    kept = False
                     try:
                         await acp.request("session/close", {"sessionId": sid},
                                           timeout=10)
@@ -624,7 +642,7 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
         finally:
             if aff_entry is not None:
                 aff_entry["busy"] = False
-            if abnormal or aff_key is None:
+            if abnormal or aff_key is None or not kept:
                 acp.forget_session(sid)
     finally:
         acp._active -= 1
