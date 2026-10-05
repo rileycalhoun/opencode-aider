@@ -510,18 +510,16 @@ async def collect(model, prompt, stream_cb=None, log=None,
     """
     t0 = time.monotonic()
     _offered_v, _forced_v, _mode_v = None, None, "auto"
-    if enforce is None:
-        pass  # direct caller: no catalogue to enforce against
-    else:
+    if enforce is not None:
+        # Direct caller passes None: no catalogue to enforce against.
         try:
             _offered_v, _forced_v, _mode_v = enforce
             assert isinstance(_offered_v, list)
             assert _mode_v in ("auto", "none", "required")
-            enforce = (_offered_v, _forced_v, _mode_v)
         except Exception as _e:
             print("[proxy] enforce contract invalid (%s): skipped"
                   % _e, flush=True)
-            enforce = None
+            _offered_v, _forced_v, _mode_v = None, None, "auto"
     first_at = None
     def note_text():
         nonlocal first_at
@@ -592,12 +590,15 @@ async def collect(model, prompt, stream_cb=None, log=None,
             if time.monotonic() < deadline - 1 and attempt < 2:
                 if log:
                     log("attempt timeout: fresh retry with budget left")
+                if stream_cb:
+                    await stream_cb(
+                        "\n[shim: attempt timed out; retrying turn]\n")
                 continue
             raise AcpError("attempt exceeded remaining request budget")
         except (ShimError, AcpError) as e:
             msg = str(e)
-            _no_fenced = (not (enforce and enforce[0])
-                          or (enforce and enforce[2] == "none"))
+            _no_fenced = (_offered_v is not None
+                          and (not _offered_v or _mode_v == "none"))
             if "alien_tool_frame:" in msg and _no_fenced:
                 # No fenced tools exist in this turn: prose is the only
                 # useful output. Flush held text, keep what streamed.
@@ -647,37 +648,36 @@ async def collect(model, prompt, stream_cb=None, log=None,
                 tool_raw.append(seg)
 
         calls = parse_tool_block("".join(tool_raw))
-        _offered_names, _forced_name, _mode = enforce
         _affkey = affinity[0] if affinity else None
-        if enforce and calls:
-            if _mode == "none":
+        if _offered_v is not None and calls:
+            if _mode_v == "none":
                 if log:
                     log("dropping %d calls: tool_choice none" % len(calls))
                 calls = []
             else:
                 kept = [c for c in calls
-                        if c["function"]["name"] in _offered_names
-                        and (_forced_name is None
-                             or c["function"]["name"] == _forced_name)]
+                        if c["function"]["name"] in _offered_v
+                        and (_forced_v is None
+                             or c["function"]["name"] == _forced_v)]
                 if len(kept) != len(calls) and log:
                     log("dropping %d unenforced calls"
                         % (len(calls) - len(kept)))
                 calls = kept
-        if (_mode == "required" and not calls
+        if (_mode_v == "required" and not calls
                 and not corrected and attempt < 2):
             prompt = (prompt + "\n\n[system] You MUST emit the fenced "
                       "<tool_call> block this turn" +
-                      ("" if _forced_name is None
-                       else " for `%s`" % _forced_name) +
+                      ("" if _forced_v is None
+                       else " for `%s`" % _forced_v) +
                       ". Plain prose is not acceptable. Judge only the "
                       "final answer; prior attempts are superseded.")
             corrected = True
             _drop_if_idle(affinity[0] if affinity else None)
             affinity = None
             continue
-        if _mode == "required" and not calls:
+        if _mode_v == "required" and not calls:
             raise ShimError("required tool %s produced no call"
-                            % (_forced_name or "any"))
+                            % (_forced_v or "any"))
         if not calls and not alien and attempt < 2 and NARRATE_RE.search("".join(text_parts)):
             _drop_if_idle(affinity and affinity[0])
             # Model talked about the protocol instead of using it. Correct it.
