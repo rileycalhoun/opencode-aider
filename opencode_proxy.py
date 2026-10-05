@@ -116,7 +116,7 @@ Rules:
   block. They are executed in parallel.
 - Use EXACT tool names as written below.
 - When you already have everything you need, reply with plain prose and NO block.
-- For READS use the native shimreads_file_read / shimreads_glob / shimreads_grep tools (fast, structured arguments). Project files live under /home/opencode/projects/ (agents call it /projects/).
+- You have NO built-in tools: no shell, no file readers, no task runners. Anything you cannot do with a listed tool, say so in prose instead of reaching for one.
 
 Completed example (real call — copy this shape exactly, with a real tool name):
 

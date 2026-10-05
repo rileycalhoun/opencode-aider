@@ -341,12 +341,11 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
     abnormal = True  # safe default: early failure forgets session state
     try:
         if not shared:
-            resp = await acp.request(
-                "session/new",
-                {"cwd": workdir, "mcpServers": [{
-                    "type": "stdio", "name": MCP_BRIDGE_NAME,
-                    "command": MCP_BRIDGE_CMD, "args": [MCP_BRIDGE_SCRIPT],
-                    "env": []}]})
+            # No MCP servers, ever: only fenced client tools exist here.
+            # (MCP_BRIDGE_* kept for debugging; do not re-enable without
+            # need. Server-side tools bypass client approvals.)
+            resp = await acp.request("session/new",
+                                     {"cwd": workdir, "mcpServers": []})
             sid = (resp.get("result") or {}).get("sessionId")
             if not sid:
                 raise AcpError("session/new gave no sessionId: %s"
