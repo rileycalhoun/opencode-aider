@@ -509,6 +509,7 @@ async def collect(model, prompt, stream_cb=None, log=None,
     so minutes of legitimate model compute looked identical to a hang.
     """
     t0 = time.monotonic()
+    _offered_v, _forced_v, _mode_v = None, None, "auto"
     if enforce is None:
         pass  # direct caller: no catalogue to enforce against
     else:
@@ -586,8 +587,12 @@ async def collect(model, prompt, stream_cb=None, log=None,
                 await gen.aclose()
             except Exception:
                 pass
-            if time.monotonic() < deadline - 1:
-                raise AcpError("prompt failed: transient timeout, retrying")
+            _drop_if_idle(affinity[0] if affinity else None)
+            affinity = None
+            if time.monotonic() < deadline - 1 and attempt < 2:
+                if log:
+                    log("attempt timeout: fresh retry with budget left")
+                continue
             raise AcpError("attempt exceeded remaining request budget")
         except (ShimError, AcpError) as e:
             msg = str(e)
@@ -804,7 +809,7 @@ async def handle_direct(request, body, model):
                 except Exception:
                     pass
             await upstream.release()
-            if ok:
+            if ok and upstream.status < 400:
                 print("[proxy] direct %s streamed done" % model, flush=True)
             return resp
         try:
