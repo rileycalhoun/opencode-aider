@@ -112,8 +112,9 @@ huge = {"messages": [{"role": "user", "content": "x" * 200000}],
             "name": "t", "description": "d" * 5000,
             "parameters": {"type": "object", "properties": {"a": {"type": "string"}}}}}]}
 p = p4.build_prompt(huge)
-ok("200k-char prompt built", len(p) > 200000, f"len={len(p)}")
-ok("exceeds the Windows argv cap", len(p) > 32767)
+ok("200k-char prompt capped at ceiling", len(p) <= p4.MAX_PROMPT_CHARS + 20000, f"len={len(p)}")
+ok("elision marker present", "older chars elided" in p)
+ok("tail survives cap", p.rstrip().endswith("x"))
 
 print(f"\n================ {passed} passed, {failed} failed ================")
 sys.exit(1 if failed else 0)

@@ -42,6 +42,8 @@ OPENCODE_CLI = os.environ.get(
 # permission prompt stalled), read timeouts, connection resets.
 TRANSIENT_RE = re.compile(r"interrupt|abort|timeout|econn|reset|timed out", re.I)
 NARRATE_RE = re.compile(r"tool protocol|fenced block|only.*block|emit.*block", re.I)
+MAX_PROMPT_CHARS = 60000  # ceiling for flattened convo; head elided past this
+TOOL_DESC_LIMIT = 200  # per-tool description chars kept in catalogue
 DEFAULT_MODEL = "longcat-2.5-preview-free"
 
 FREE_MODELS = [
@@ -114,6 +116,7 @@ Rules:
   block. They are executed in parallel.
 - Use EXACT tool names as written below.
 - When you already have everything you need, reply with plain prose and NO block.
+- For READS use the native shimreads_file_read / shimreads_glob / shimreads_grep tools (fast, structured arguments). Project files live under /home/opencode/projects/ (agents call it /projects/).
 
 Completed example (real call — copy this shape exactly, with a real tool name):
 
@@ -121,6 +124,9 @@ Completed example (real call — copy this shape exactly, with a real tool name)
 {"name": "get_items", "arguments": {}}
 </tool_call>
 """
+
+PROTOCOL_SPARK = PROTOCOL + """\
+Names like todowrite, task, bash, read, skill, websearch are NOT yours. They do not exist here. Emitting one fails the turn outright — use the fenced block above with a listed tool instead."""
 
 
 def resolve_model(name):
@@ -154,7 +160,10 @@ def render_tools(tools):
         fn = t.get("function") or {}
         out.append(f"## {fn.get('name')}")
         if fn.get("description"):
-            out.append(fn["description"].strip())
+            desc = fn["description"].strip()
+            if len(desc) > TOOL_DESC_LIMIT:
+                desc = desc[:TOOL_DESC_LIMIT] + "\u2026"
+            out.append(desc)
         schema = fn.get("parameters") or {}
         props = schema.get("properties") or {}
         if props:
@@ -225,9 +234,9 @@ def tool_choice_directive(body):
     """
     tc = body.get("tool_choice")
     if tc is None or tc == "auto":
-        return True, ""
+        return True, "", None
     if tc == "none":
-        return False, ""
+        return False, "", None
     name = None
     if isinstance(tc, dict):
         if tc.get("type") == "function":
@@ -236,24 +245,53 @@ def tool_choice_directive(body):
         else:
             name = tc.get("name")
     if not name:
-        return True, ""
+        return True, "", None
     return True, (
         "[system] The caller requires a call to `%s` this turn. Respond "
         "with ONLY the tool-call block for that tool, no prose before or "
-        "after it." % name)
+        "after it." % name), name
+
+
+def affinity_key_for(model, body, header_key=None):
+    """Stable conversation key: explicit header wins, else hash of
+    model + system + first user message. Collisions across DISTINCT live
+    conversations fall back safe (busy sessions go fresh)."""
+    if header_key:
+        return "x:" + header_key[:64]
+    import hashlib as _hl
+    msgs = body.get("messages", [])
+    sys_text = " ".join(
+        _content_to_text(m.get("content")) for m in msgs
+        if m.get("role") == "system")[:2000]
+    first_user = next((m for m in msgs if m.get("role") == "user"), {})
+    first_text = _content_to_text(first_user.get("content"))[:2000]
+    return "h:" + _hl.sha1(
+        (model + "|" + sys_text + "|" + first_text).encode()).hexdigest()[:16]
 
 
 def build_prompt(body):
     msgs = body.get("messages", [])
     tools = body.get("tools") or []
-    render_catalogue, directive = tool_choice_directive(body)
+    render_catalogue, directive, forced = tool_choice_directive(body)
+    if forced:
+        # Forced turn: render ONLY the demanded tool. Full 67-tool catalogue
+        # buries the directive and burns ~30-100k chars.
+        tools = [t for t in tools
+                 if ((t.get("function") or {}).get("name") == forced)] or tools
     parts = []
     if tools and render_catalogue:
-        parts.append(PROTOCOL)
+        model_name = (body.get("model") or "").lower()
+        proto = PROTOCOL_SPARK if "muse-spark" in model_name else PROTOCOL
+        parts.append(proto)
         parts.append(render_tools(tools))
     if directive:
         parts.append(directive)
     convo = flatten_history(msgs)
+    if len(convo) > MAX_PROMPT_CHARS:
+        # Keep the head (usually system prompt) + the recent tail.
+        head, tail = convo[:4000], convo[-(MAX_PROMPT_CHARS - 4000):]
+        convo = ("[shim: %d older chars elided]\n" % (len(convo) - MAX_PROMPT_CHARS)
+                 + head + "\n\n...\n\n" + tail)
     parts.append(convo if convo else "Hello")
     return "\n\n".join(p for p in parts if p)
 
@@ -379,7 +417,8 @@ class ShimError(Exception):
 # collect() below is unchanged apart from its event source.
 
 
-async def collect(model, prompt, stream_cb=None, log=None):
+async def collect(model, prompt, stream_cb=None, log=None,
+                  progress_cb=None, affinity=None):
     """Run one turn. Returns (text, tool_calls, alien_tool_names).
 
     Logs time-to-first-text so a slow-prefill turn is distinguishable from a
@@ -403,11 +442,24 @@ async def collect(model, prompt, stream_cb=None, log=None):
     # the client sees the turn 'finish' with no tool calls.
 
     alien = []
+    corrected = False
+
+    async def progress(msg):
+        if progress_cb is None:
+            return
+        try:
+            res = progress_cb(msg)
+            if res is not None:
+                await res
+        except Exception:
+            pass
+
     for attempt in range(3):
         sp = Splitter()
         text_parts, tool_raw = [], []
         alien = []
-        gen = acp_turn_events(model, prompt)
+        gen = acp_turn_events(model, prompt, progress_cb=progress,
+                                affinity=affinity)
         try:
             async for ev, payload in gen:
                 if ev == "text":
@@ -421,6 +473,7 @@ async def collect(model, prompt, stream_cb=None, log=None):
                             tool_raw.append(seg)
                 elif ev == "alien_tool":
                     alien.append(payload)
+                    await progress("executing %s\u2026" % payload)
         except (ShimError, AcpError) as e:
             if attempt < 2 and TRANSIENT_RE.search(str(e)):
                 if stream_cb:
@@ -452,15 +505,21 @@ async def collect(model, prompt, stream_cb=None, log=None):
                       "protocol instead of using it. Do not explain or narrate. Either "
                       "emit ONLY the fenced <tool_call> block, or reply with plain "
                       "prose and no block.")
+            corrected = True
             continue
         if calls or not alien or attempt == 2:
-            return "".join(text_parts), calls, alien
+            return "".join(text_parts), calls, alien, attempt + 1
+        if corrected:
+            # Already spent the one correction on narration; hand the alien
+            # turn back so the CLIENT re-plans instead of burning full resends.
+            return "".join(text_parts), calls, alien, attempt + 1
+        corrected = True
         # The model tried a tool that does not exist in the client. Correct it.
         prompt = (prompt + "\n\n[system] Your last attempt tried to use a built-in "
                   "tool (" + ", ".join(sorted(set(alien))) + "). That tool does not "
                   "exist here and its output is discarded. Use the tool protocol "
                   "above with one of the listed tools, or answer in plain text.")
-    return "", [], []
+    return "", [], [], 3
 
 
 # ── SSE plumbing ─────────────────────────────────────────────────────────────
@@ -500,14 +559,15 @@ def tool_call_chunks(cid, model, calls):
     return out
 
 
-def final_body(cid, model, text, calls):
+def final_body(cid, model, text, calls, shim=None):
     msg = {"role": "assistant", "content": text or None}
     if calls:
         msg["tool_calls"] = calls
     return {"id": cid, "object": "chat.completion", "created": 0, "model": model,
             "choices": [{"index": 0, "message": msg,
                          "finish_reason": "tool_calls" if calls else "stop"}],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "shim": shim or {}}
 
 
 # ── direct Zen passthrough ───────────────────────────
@@ -596,16 +656,29 @@ async def handle_chat(request):
     stream = bool(body.get("stream"))
     ntools = len(body.get("tools") or [])
     prompt = build_prompt(body)
+    from acp_transport import peek_sent as _peek
+    _akey = affinity_key_for(
+        model, body, request.headers.get("X-Shim-Session"))
+    _sent = _peek(_akey)
+    if _sent is not None:
+        _delta = flatten_history(body.get("messages", [])[_sent:])
+        affinity = (_akey, _delta, len(body.get("messages", [])))
+    else:
+        affinity = (_akey, "", len(body.get("messages", [])))
     print(f"[proxy] {requested}->{model} {len(prompt)}ch "
           f"{'stream' if stream else 'block'} tools={ntools}", flush=True)
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
 
     if not stream:
         try:
-            text, calls, alien = await collect(
+            text, calls, alien, attempts = await collect(
                 model, prompt,
-                log=lambda m: print(f"[proxy] {cid} {m}", flush=True))
-            return web.json_response(final_body(cid, model, text, calls))
+                log=lambda m: print(f"[proxy] {cid} {m}", flush=True),
+                affinity=affinity)
+            return web.json_response(final_body(cid, model, text, calls,
+                                               shim={"prompt_chars": len(prompt),
+                                                     "alien": alien,
+                                                     "attempts": attempts}))
         except Exception as e:
             print(f"[proxy] ERROR: {e}", flush=True)
             return web.json_response({"error": {"message": str(e)}}, status=502)
@@ -624,11 +697,18 @@ async def handle_chat(request):
         async def on_text(seg):
             await send(chunk(cid, model, delta={"content": seg}))
 
-        text, calls, alien = await collect(
-            model, prompt, stream_cb=on_text,
-            log=lambda m: print(f"[proxy] {cid} {m}", flush=True))
+        async def on_progress(msg):
+            await send(": [shim: %s]" % msg)
+
+        text, calls, alien, attempts = await collect(
+            model, prompt, stream_cb=on_text, progress_cb=on_progress,
+            log=lambda m: print(f"[proxy] {cid} {m}", flush=True),
+            affinity=affinity)
         for payload in tool_call_chunks(cid, model, calls):
             await send(payload)
+        await send(": [shim: prompt=%dch alien=%s attempts=%d]"
+                   % (len(prompt), ",".join(sorted(set(alien))) or "none",
+                      attempts))
         await send(chunk(cid, model, finish="tool_calls" if calls else "stop"))
         await send("[DONE]")
         await resp.write_eof()

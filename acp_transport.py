@@ -51,6 +51,9 @@ TURN_TIMEOUT = 1200  # hard ceiling per turn (20 min)
 MAX_TURNS_PER_PROC = 25  # recycle the shared proc past this many turns
 STDERR_RING = 200  # agent stderr lines kept for failure dumps
 USAGE_LOG_STEP = 50000  # log a heartbeat every this many tokens
+MCP_BRIDGE_NAME = "shimreads"  # read-only tools; server executes, no roundtrip
+MCP_BRIDGE_CMD = "/home/opencode/opencode-compat-shim/.venv/bin/python"
+MCP_BRIDGE_SCRIPT = "/home/opencode/opencode-compat-shim-fork/mcp_bridge.py"
 
 
 class AcpError(Exception):
@@ -127,6 +130,7 @@ class AcpProcess:
             )
             self._pending = {}
             self._sessions = {}
+            clear_affinity()  # sids die with the proc
             self._turns = 0
             self._stderr_ring.clear()
             _log("ACP proc spawned pid=%s" % self.proc.pid)
@@ -254,34 +258,120 @@ class AcpProcess:
 
 _ACP = AcpProcess()
 
+# Session affinity: key -> {"sid", "sent", "last", "busy", "model"}.
+# Reuses one ACP session across turns of the same conversation so follow-up
+# prompts send ONLY new messages instead of re-sending 100k+ chars.
+# Safety: busy sessions are never shared (concurrent turn goes fresh);
+# idle >30min evicted; any turn failure drops the mapping (fresh next time);
+# proc recycle clears the map (sids die with the proc).
+_AFFINITY = {}
+_AFFINITY_IDLE = 1800
+_AFFINITY_MAX = 32
 
-async def acp_turn_events(model, prompt_text, workdir=ACP_HOME):
-    """Yield ('text', delta) | ('alien_tool', name) for one model turn."""
+
+def affinity_key(key):
+    return key
+
+
+def peek_sent(key):
+    e = _AFFINITY.get(key)
+    if not e:
+        return None
+    import time as _t
+    if _t.monotonic() - e["last"] > _AFFINITY_IDLE:
+        return None
+    if e["busy"]:
+        return None
+    return e["sent"]
+
+
+def mark_sent(key, sid, count, model):
+    import time as _t
+    while len(_AFFINITY) >= _AFFINITY_MAX and key not in _AFFINITY:
+        oldest = min(_AFFINITY, key=lambda k: _AFFINITY[k]["last"])
+        _AFFINITY.pop(oldest, None)
+    _AFFINITY[key] = {"sid": sid, "sent": count, "last": _t.monotonic(),
+                      "busy": False, "model": model}
+
+
+def drop_affinity(key):
+    _AFFINITY.pop(key, None)
+
+
+def clear_affinity():
+    _AFFINITY.clear()
+
+
+_ACP = AcpProcess()
+
+
+async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
+                          progress_cb=None, affinity=None):
+    """Yield ('text', delta) | ('alien_tool', name) for one model turn.
+    progress_cb, when given, fires on usage milestones so callers can
+    heartbeat the client instead of sitting silent."""
     acp = _ACP
     await acp.ensure_alive()
     acp._active += 1
     acp._turns += 1
     last_usage_logged = 0
+    # affinity: (key, delta_text, full_count). Fresh session when key unknown,
+    # busy, idle, or model-mismatched server state unclear -> fall back safe.
+    aff_key = aff_delta = aff_count = None
+    aff_entry = None
+    bridged_ids = set()
+    if affinity:
+        aff_key, aff_delta, aff_count = affinity
+        aff_entry = _AFFINITY.get(aff_key)
+        if aff_entry is not None:
+            import time as _t
+            if (aff_entry["busy"]
+                    or _t.monotonic() - aff_entry["last"] > _AFFINITY_IDLE
+                    or aff_entry["sid"] not in acp._sessions):
+                aff_entry = None
+        if aff_entry is not None:
+            aff_entry["busy"] = True
     turn_start = asyncio.get_event_loop().time()
     frames_seen = 0
     last_frame_kind = "none"
     tool_active = False  # set on tool_call, cleared on text (ACP is silent mid-tool)
+    shared = aff_entry is not None
+    sid = aff_entry["sid"] if shared else None
+    ok = True
+    abnormal = True  # safe default: early failure forgets session state
     try:
-        resp = await acp.request("session/new",
-                                 {"cwd": workdir, "mcpServers": []})
-        sid = (resp.get("result") or {}).get("sessionId")
-        if not sid:
-            raise AcpError("session/new gave no sessionId: %s"
-                           % json.dumps(resp)[:200])
+        if not shared:
+            resp = await acp.request(
+                "session/new",
+                {"cwd": workdir, "mcpServers": [{
+                    "type": "stdio", "name": MCP_BRIDGE_NAME,
+                    "command": MCP_BRIDGE_CMD, "args": [MCP_BRIDGE_SCRIPT],
+                    "env": []}]})
+            sid = (resp.get("result") or {}).get("sessionId")
+            if not sid:
+                raise AcpError("session/new gave no sessionId: %s"
+                               % json.dumps(resp)[:200])
+        else:
+            _log("affinity hit %s: delta %dch (saved full resend)"
+                 % (aff_key, len(aff_delta or "")))
         try:
-            await acp.request("session/set_config_option",
-                              {"sessionId": sid, "configId": "model",
-                               "value": "opencode/" + model})
+            # Register the queue FIRST: frames arriving between session/new
+            # and set_config had nowhere to land (the 2/turn unknown-session
+            # drops in the log).
             updates = acp.session_queue(sid)
+            if not shared or aff_entry.get("model") != model:
+                await acp.request("session/set_config_option",
+                                  {"sessionId": sid, "configId": "model",
+                                   "value": "opencode/" + model})
+            send_text = prompt_text
+            if shared and aff_delta:
+                send_text = aff_delta  # follow-up: only what's new
+            # Empty delta: re-send full text into the SAME session (re-sync),
+            # keep the mapping.
             prompt_task = asyncio.ensure_future(acp.request(
                 "session/prompt",
                 {"sessionId": sid, "prompt": [
-                    {"type": "text", "text": prompt_text}]},
+                    {"type": "text", "text": send_text}]},
                 timeout=TURN_TIMEOUT))
             pending_get = asyncio.ensure_future(updates.get())
             try:
@@ -327,9 +417,32 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME):
                             tool_active = False  # model spoke: prior tool done
                             yield ("text", content["text"])
                     elif kind in ("tool_call", "tool_call_update"):
-                        tool_active = True
-                        yield ("alien_tool",
-                               update.get("title") or "unknown")
+                        title = update.get("title") or ""
+                        call_id = update.get("toolCallId") or ""
+                        if call_id and call_id in bridged_ids:
+                            bridged = True
+                        else:
+                            bridged = (title == MCP_BRIDGE_NAME
+                                       or title.startswith(MCP_BRIDGE_NAME + "_"))
+                            if bridged and call_id:
+                                bridged_ids.add(call_id)
+                            elif not title and not bridged:
+                                _log("untitled tool frame: %s"
+                                     % json.dumps(update)[:200])
+                        if bridged:
+                            # Server-side read (file_read/glob/grep): executed
+                            # synchronously, result already in-frame. Forward
+                            # as progress so the client sees movement.
+                            if progress_cb is not None:
+                                try:
+                                    res = progress_cb("read %s" % title)
+                                    if res is not None:
+                                        await res
+                                except Exception:
+                                    pass
+                        else:
+                            tool_active = True
+                            yield ("alien_tool", title)
                     elif kind == "usage_update":
                         try:
                             used = int(update.get("used") or 0)
@@ -338,26 +451,52 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME):
                         if used - last_usage_logged >= USAGE_LOG_STEP:
                             last_usage_logged = used
                             _log("turn progress: %dk tokens so far" % (used // 1000))
+                            if progress_cb is not None:
+                                try:
+                                    res = progress_cb(
+                                        "%dk tokens so far" % (used // 1000))
+                                    if res is not None:
+                                        await res
+                                except Exception:
+                                    pass
                     # ignore: available_commands_update, etc.
             finally:
                 if not pending_get.done():
                     pending_get.cancel()
-                if not prompt_task.done():
-                    # Abnormal exit (disconnect/timeout/cancel): tell the
-                    # server to STOP WORK, not just stop listening. Cancelling
-                    # our wait-future alone leaves the turn running blind.
+                abnormal = not prompt_task.done()
+                if abnormal:
+                    # Abnormal exit: tell the server to STOP WORK.
                     prompt_task.cancel()
                     try:
                         await acp.request("session/cancel",
                                           {"sessionId": sid}, timeout=10)
                     except Exception:
                         pass
-                try:
-                    await acp.request("session/close", {"sessionId": sid},
-                                      timeout=10)
-                except Exception:
-                    pass
+                if abnormal:
+                    # Failed turn: poison would linger server-side. Close and
+                    # forget so the next turn starts clean.
+                    if shared:
+                        drop_affinity(aff_key)
+                    try:
+                        await acp.request("session/close", {"sessionId": sid},
+                                          timeout=10)
+                    except Exception:
+                        pass
+                elif aff_key is not None:
+                    # Healthy turn with a conversation key: keep the session,
+                    # record how many messages the server has seen.
+                    mark_sent(aff_key, sid, aff_count, model)
+                else:
+                    # No key (direct collect callers): one-shot, close it.
+                    try:
+                        await acp.request("session/close", {"sessionId": sid},
+                                          timeout=10)
+                    except Exception:
+                        pass
         finally:
-            acp.forget_session(sid)
+            if aff_entry is not None:
+                aff_entry["busy"] = False
+            if abnormal or aff_key is None:
+                acp.forget_session(sid)
     finally:
         acp._active -= 1
