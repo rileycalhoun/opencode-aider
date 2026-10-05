@@ -30,7 +30,7 @@ Two hard problems this solves, both verified empirically (2026-09-28):
 """
 
 import asyncio, json, os, uuid, argparse, re, time
-from acp_transport import AcpError, acp_turn_events
+from acp_transport import AcpError, TURN_TIMEOUT, acp_turn_events
 from aiohttp import web
 
 OPENCODE_CLI = os.environ.get(
@@ -168,11 +168,15 @@ def render_tools(tools):
         props = schema.get("properties") or {}
         if props:
             out.append("parameters (JSON Schema):")
-            out.append(json.dumps(
+            schema_txt = json.dumps(
                 {"type": schema.get("type", "object"),
                  "properties": props,
                  "required": schema.get("required", [])},
-                ensure_ascii=False, separators=(",", ":")))
+                ensure_ascii=False, separators=(",", ":"))
+            if len(schema_txt) > 1500:
+                schema_txt = (schema_txt[:1500]
+                              + "\u2026(truncated: match names from above)")
+            out.append(schema_txt)
         out.append("")
     return "\n".join(out)
 
@@ -257,7 +261,8 @@ def affinity_key_for(model, body, header_key=None):
     model + system + first user message. Collisions across DISTINCT live
     conversations fall back safe (busy sessions go fresh)."""
     if header_key:
-        return "x:" + header_key[:64]
+        import hashlib as _hl2
+        return "x:" + _hl2.sha1(header_key.encode()).hexdigest()[:16]
     import hashlib as _hl
     msgs = body.get("messages", [])
     sys_text = " ".join(
@@ -350,43 +355,63 @@ class Splitter:
             return
 
     def flush(self):
-        """Emit whatever is left when the model stops."""
+        """Emit whatever is left when the model stops. An UNCLOSED fence
+        is dropped (logged), never parsed: partial JSON must not become a
+        call."""
         if self.buf:
-            yield ("tool" if self.in_tool else "text", self.buf)
+            if self.in_tool:
+                print("[proxy] splitter: dropping unclosed fence tail: %s"
+                      % self.buf[:160], flush=True)
+            else:
+                yield ("text", self.buf)
             self.buf = ""
         self.in_tool = False
 
 
 def parse_tool_block(raw):
-    """Parse the inside of a tool fence into a list of OpenAI tool calls."""
-    raw = raw.strip()
-    if not raw:
-        return []
-    obj = None
-    try:
-        obj = json.loads(raw)
-    except json.JSONDecodeError:
-        objs = []
-        for line in raw.splitlines():
-            line = line.strip().rstrip(",")
-            if not line:
-                continue
-            try:
-                objs.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-        obj = objs or None
-    if obj is None:
-        return []
-    items = obj if isinstance(obj, list) else [obj]
+    """Parse fenced tool bodies into OpenAI tool calls.
+
+    Uses a raw_decode loop so adjacent blocks (no separator) and
+    pretty-printed multi-line JSON both parse. Anything that is not a
+    COMPLETE top-level object with a truthy name is dropped and logged --
+    never manufactured (an unclosed fence yields nothing).
+    """
+    objs = []
+    s = (raw or "").strip()
+    # Strip a markdown wrapper if the model fenced the fence.
+    if s.startswith("```"):
+        lines = s.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        s = "\n".join(lines)
+    dec = json.JSONDecoder()
+    while s.strip():
+        s = s.strip()
+        if s[0] != "{":
+            i = s.find("{")
+            if i < 0:
+                break
+            s = s[i:]
+        try:
+            obj, end = dec.raw_decode(s)
+        except json.JSONDecodeError:
+            print("[proxy] parse: dropping unparsable tool text: %s"
+                  % s[:160], flush=True)
+            break
+        objs.append(obj)
+        s = s[end:].lstrip().lstrip(",")
     calls = []
-    for it in items:
+    for it in objs:
         if not isinstance(it, dict):
             continue
         name = it.get("name") or it.get("tool") or it.get("function")
         if isinstance(name, dict):
             name = name.get("name")
-        if not name:
+        if not name or not isinstance(name, str):
+            print("[proxy] parse: dropping nameless tool object",
+                  flush=True)
             continue
         args = it.get("arguments", it.get("parameters", it.get("args", {})))
         if isinstance(args, str):
@@ -417,8 +442,12 @@ class ShimError(Exception):
 # collect() below is unchanged apart from its event source.
 
 
+REQUEST_BUDGET = 1500  # hard ceiling per client request, all attempts
+
+
 async def collect(model, prompt, stream_cb=None, log=None,
-                  progress_cb=None, affinity=None):
+                  progress_cb=None, affinity=None, enforce=None,
+                  turn_timeout=None):
     """Run one turn. Returns (text, tool_calls, alien_tool_names).
 
     Logs time-to-first-text so a slow-prefill turn is distinguishable from a
@@ -443,6 +472,7 @@ async def collect(model, prompt, stream_cb=None, log=None,
 
     alien = []
     corrected = False
+    deadline = time.monotonic() + REQUEST_BUDGET
 
     async def progress(msg):
         if progress_cb is None:
@@ -451,6 +481,8 @@ async def collect(model, prompt, stream_cb=None, log=None,
             res = progress_cb(msg)
             if res is not None:
                 await res
+        except (ConnectionResetError, asyncio.CancelledError):
+            raise
         except Exception:
             pass
 
@@ -458,8 +490,14 @@ async def collect(model, prompt, stream_cb=None, log=None,
         sp = Splitter()
         text_parts, tool_raw = [], []
         alien = []
+        remaining = deadline - time.monotonic()
+        if remaining < 30:
+            raise AcpError("request budget exhausted (%ds across attempts)"
+                           % REQUEST_BUDGET)
+        use_timeout = min(
+            turn_timeout or TURN_TIMEOUT, int(remaining))
         gen = acp_turn_events(model, prompt, progress_cb=progress,
-                                affinity=affinity)
+                              affinity=affinity, turn_timeout=use_timeout)
         try:
             async for ev, payload in gen:
                 if ev == "text":
@@ -472,12 +510,27 @@ async def collect(model, prompt, stream_cb=None, log=None,
                         else:
                             tool_raw.append(seg)
                 elif ev == "alien_tool":
+                    # Transport raises on tool frames instead (cancel path);
+                    # this survives only for direct collect() callers.
                     alien.append(payload)
                     await progress("executing %s\u2026" % payload)
         except (ShimError, AcpError) as e:
-            if attempt < 2 and TRANSIENT_RE.search(str(e)):
+            msg = str(e)
+            if ("alien_tool_frame:" in msg and not corrected
+                    and attempt < 2):
+                aname = msg.split(":", 2)[1] if msg.count(":") >= 2 else "?"
+                prompt = (prompt + "\n\n[system] Your last attempt reached "
+                          "for a built-in tool (" + aname + ") that does not "
+                          "exist here. Use the fenced <tool_call> block with "
+                          "a listed tool, or answer in plain text. Judge only "
+                          "the final answer; prior attempts are superseded.")
+                corrected = True
+                affinity = None  # fresh session, not a duplicate re-send
+                continue
+            if attempt < 2 and TRANSIENT_RE.search(msg):
                 if stream_cb:
                     await stream_cb(f"\n[shim: turn transport failed ({e}); retrying turn]\n")
+                affinity = None
                 continue
             raise
         except (ConnectionResetError, asyncio.CancelledError):
@@ -499,13 +552,30 @@ async def collect(model, prompt, stream_cb=None, log=None,
                 tool_raw.append(seg)
 
         calls = parse_tool_block("".join(tool_raw))
+        if enforce and calls:
+            offered, forced, none_flag = enforce
+            if none_flag:
+                if log:
+                    log("dropping %d calls: tool_choice none" % len(calls))
+                calls = []
+            else:
+                kept = [c for c in calls
+                        if c["function"]["name"] in offered
+                        and (forced is None
+                             or c["function"]["name"] == forced)]
+                if len(kept) != len(calls) and log:
+                    log("dropping %d unenforced calls"
+                        % (len(calls) - len(kept)))
+                calls = kept
         if not calls and not alien and attempt < 2 and NARRATE_RE.search("".join(text_parts)):
             # Model talked about the protocol instead of using it. Correct it.
             prompt = (prompt + "\n\n[system] Your last response talked about the tool "
                       "protocol instead of using it. Do not explain or narrate. Either "
                       "emit ONLY the fenced <tool_call> block, or reply with plain "
-                      "prose and no block.")
+                      "prose and no block. Judge only the final answer; prior "
+                      "attempts are superseded.")
             corrected = True
+            affinity = None  # retry starts a fresh session, not a re-send
             continue
         if calls or not alien or attempt == 2:
             return "".join(text_parts), calls, alien, attempt + 1
@@ -592,10 +662,16 @@ async def handle_direct(request, body, model):
     timeout = _aiohttp.ClientTimeout(total=600, sock_read=300)
     try:
         session = _aiohttp.ClientSession(timeout=timeout)
+    except Exception as e:
+        return web.json_response(
+            {"error": {"message": "zen unreachable: %s" % e,
+                       "type": "server_error"}}, status=502)
+    try:
         upstream = await session.post(
             ZEN_API_URL + "/chat/completions",
             headers=headers, json=body)
     except Exception as e:
+        await session.close()
         return web.json_response(
             {"error": {"message": "zen unreachable: %s" % e,
                        "type": "server_error"}}, status=502)
@@ -611,6 +687,12 @@ async def handle_direct(request, body, model):
             await resp.write_eof()
         except (ConnectionResetError, asyncio.CancelledError):
             pass
+        except Exception as e:
+            print("[proxy] direct stream error: %s" % e, flush=True)
+            try:
+                await resp.write_eof()
+            except Exception:
+                pass
         finally:
             await upstream.release()
             await session.close()
@@ -656,15 +738,26 @@ async def handle_chat(request):
     stream = bool(body.get("stream"))
     ntools = len(body.get("tools") or [])
     prompt = build_prompt(body)
+    _offered = [((t.get("function") or {}).get("name") or "")
+                for t in (body.get("tools") or [])]
+    _tc = body.get("tool_choice")
+    _forced = None
+    if isinstance(_tc, dict):
+        _fn = _tc.get("function") or {}
+        _forced = _fn.get("name") or _tc.get("name")
+    _enforce = (_offered, _forced, _tc == "none")
     from acp_transport import peek_sent as _peek
     _akey = affinity_key_for(
         model, body, request.headers.get("X-Shim-Session"))
     _sent = _peek(_akey)
     if _sent is not None:
+        import hashlib as _hl3
+        _prior = flatten_history(body.get("messages", [])[:_sent])
+        _pfx = _hl3.sha1(_prior.encode()).hexdigest()[:16]
         _delta = flatten_history(body.get("messages", [])[_sent:])
-        affinity = (_akey, _delta, len(body.get("messages", [])))
+        affinity = (_akey, _delta, len(body.get("messages", [])), _pfx)
     else:
-        affinity = (_akey, "", len(body.get("messages", [])))
+        affinity = (_akey, "", len(body.get("messages", [])), None)
     print(f"[proxy] {requested}->{model} {len(prompt)}ch "
           f"{'stream' if stream else 'block'} tools={ntools}", flush=True)
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
@@ -674,7 +767,7 @@ async def handle_chat(request):
             text, calls, alien, attempts = await collect(
                 model, prompt,
                 log=lambda m: print(f"[proxy] {cid} {m}", flush=True),
-                affinity=affinity)
+                affinity=affinity, enforce=_enforce)
             return web.json_response(final_body(cid, model, text, calls,
                                                shim={"prompt_chars": len(prompt),
                                                      "alien": alien,
@@ -706,7 +799,7 @@ async def handle_chat(request):
         text, calls, alien, attempts = await collect(
             model, prompt, stream_cb=on_text, progress_cb=on_progress,
             log=lambda m: print(f"[proxy] {cid} {m}", flush=True),
-            affinity=affinity)
+            affinity=affinity, enforce=_enforce)
         for payload in tool_call_chunks(cid, model, calls):
             await send(payload)
         if _want_progress:
@@ -763,7 +856,8 @@ def main():
     print(f"[proxy] streaming :{args.port} (ACP transport)", flush=True)
     print(f"[proxy] cli exists: {os.path.exists(OPENCODE_CLI)}", flush=True)
     host = os.environ.get("OC_SHIM_HOST", "127.0.0.1")
-    web.run_app(app, host=host, port=args.port)
+    web.run_app(app, host=host, port=args.port,
+                handler_cancellation=True)
 
 
 if __name__ == "__main__":

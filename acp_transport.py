@@ -42,7 +42,8 @@ import json
 import os
 
 OPENCODE_BIN = os.environ.get("OPENCODE_CLI", "/usr/local/bin/opencode")
-ACP_HOME = "/home/opencode/.cache/acp-home"
+ACP_HOME = os.environ.get("ACP_HOME_DIR",
+                           "/home/opencode/.cache/acp-home")
 ACP_AUTH_SRC = "/home/opencode/.local/share/opencode/auth.json"
 IDLE_TIMEOUT = 300  # base: abort a turn silent this long (matches retry classifier)
 IDLE_TIMEOUT_FIRST = 600  # pre-first-frame: giant prompts are slow to start
@@ -163,9 +164,10 @@ class AcpProcess:
                 pass
 
     async def _stderr_loop(self):
+        proc = self.proc
         try:
             while True:
-                line = await self.proc.stderr.readline()
+                line = await proc.stderr.readline()
                 if not line:
                     break
                 self._stderr_ring.append(
@@ -178,9 +180,10 @@ class AcpProcess:
         return lines if lines else ["(agent stderr empty)"]
 
     async def _reader_loop(self):
+        proc = self.proc
         try:
             while True:
-                line = await self.proc.stdout.readline()
+                line = await proc.stdout.readline()
                 if not line:
                     break
                 try:
@@ -194,8 +197,9 @@ class AcpProcess:
         except Exception as e:
             _log("reader loop ended: %s" % e)
         finally:
-            self._fail_all(AcpError("acp process died"))
-            self.proc = None
+            if self.proc is proc:
+                self._fail_all(AcpError("acp process died"))
+                self.proc = None
 
     async def _dispatch(self, obj):
         if not isinstance(obj, dict):
@@ -267,6 +271,9 @@ _ACP = AcpProcess()
 _AFFINITY = {}
 _AFFINITY_IDLE = 1800
 _AFFINITY_MAX = 32
+_AFF_ORPHANS = []  # sids to close+forget (evicted while idle/busy)
+_AFF_USE = {}  # sid -> max turn tokens seen (server-side accumulation)
+AFF_USE_CAP = 250000  # fresh session past this many accumulated tokens
 
 
 def affinity_key(key):
@@ -279,23 +286,46 @@ def peek_sent(key):
         return None
     import time as _t
     if _t.monotonic() - e["last"] > _AFFINITY_IDLE:
+        _AFFINITY.pop(key, None)
+        _AFF_ORPHANS.append(e["sid"])  # idle-evicted: must be closed
+        return None
+    import time as _t
+    if _t.monotonic() - e["last"] > _AFFINITY_IDLE:
         return None
     if e["busy"]:
         return None
     return e["sent"]
 
 
-def mark_sent(key, sid, count, model):
+def mark_sent(key, sid, count, model, pfx=None):
     import time as _t
+    prev = _AFFINITY.get(key)
+    if prev is not None and prev.get("sid") != sid:
+        _AFF_ORPHANS.append(prev["sid"])  # displaced mapping: close it
     while len(_AFFINITY) >= _AFFINITY_MAX and key not in _AFFINITY:
         oldest = min(_AFFINITY, key=lambda k: _AFFINITY[k]["last"])
-        _AFFINITY.pop(oldest, None)
+        old = _AFFINITY.pop(oldest, None)
+        if old is not None:
+            _AFF_ORPHANS.append(old["sid"])
     _AFFINITY[key] = {"sid": sid, "sent": count, "last": _t.monotonic(),
-                      "busy": False, "model": model}
+                      "busy": False, "model": model, "pfx": pfx}
 
 
 def drop_affinity(key):
-    _AFFINITY.pop(key, None)
+    e = _AFFINITY.pop(key, None)
+    if e is not None:
+        _AFF_ORPHANS.append(e["sid"])
+
+
+async def reap_orphans(acp):
+    while _AFF_ORPHANS:
+        sid = _AFF_ORPHANS.pop(0)
+        try:
+            await acp.request("session/close", {"sessionId": sid},
+                              timeout=10)
+        except Exception:
+            pass
+        acp.forget_session(sid)
 
 
 def clear_affinity():
@@ -306,7 +336,8 @@ _ACP = AcpProcess()
 
 
 async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
-                          progress_cb=None, affinity=None):
+                          progress_cb=None, affinity=None,
+                          turn_timeout=TURN_TIMEOUT):
     """Yield ('text', delta) | ('alien_tool', name) for one model turn.
     progress_cb, when given, fires on usage milestones so callers can
     heartbeat the client instead of sitting silent."""
@@ -317,17 +348,27 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
     last_usage_logged = 0
     # affinity: (key, delta_text, full_count). Fresh session when key unknown,
     # busy, idle, or model-mismatched server state unclear -> fall back safe.
-    aff_key = aff_delta = aff_count = None
+    aff_key = aff_delta = aff_count = aff_pfx = None
     aff_entry = None
     bridged_ids = set()
+    await reap_orphans(acp)
     if affinity:
-        aff_key, aff_delta, aff_count = affinity
+        aff_key, aff_delta, aff_count = affinity[0], affinity[1], affinity[2]
+        aff_pfx = affinity[3] if len(affinity) > 3 else None
         aff_entry = _AFFINITY.get(aff_key)
         if aff_entry is not None:
             import time as _t
             if (aff_entry["busy"]
                     or _t.monotonic() - aff_entry["last"] > _AFFINITY_IDLE
-                    or aff_entry["sid"] not in acp._sessions):
+                    or aff_entry["sid"] not in acp._sessions
+                    or (aff_pfx is not None
+                        and aff_entry.get("pfx") is not None
+                        and aff_entry["pfx"] != aff_pfx)
+                    or _AFF_USE.get(aff_entry["sid"], 0) > AFF_USE_CAP):
+                # Busy, idle, gone, foreign conversation, or overgrown:
+                # never reuse. Orphan the sid for reaping.
+                _AFF_ORPHANS.append(aff_entry["sid"])
+                drop_affinity(aff_key)
                 aff_entry = None
         if aff_entry is not None:
             aff_entry["busy"] = True
@@ -371,7 +412,7 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                 "session/prompt",
                 {"sessionId": sid, "prompt": [
                     {"type": "text", "text": send_text}]},
-                timeout=TURN_TIMEOUT))
+                timeout=turn_timeout))
             pending_get = asyncio.ensure_future(updates.get())
             try:
                 while True:
@@ -397,10 +438,29 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                         except asyncio.CancelledError:
                             raise
                         except Exception as e:
+                            abnormal = True
                             raise AcpError("prompt failed: %s" % e)
                         if isinstance(resp, dict) and resp.get("error"):
+                            abnormal = True
                             raise AcpError("prompt refused: %s"
                                            % json.dumps(resp["error"])[:200])
+                        # Linger-drain: trailing frames already queued (final
+                        # text chunks) must not be dropped with the return.
+                        try:
+                            while True:
+                                extra = await asyncio.wait_for(
+                                    updates.get(), timeout=1.5)
+                                frames_seen += 1
+                                if isinstance(extra, dict):
+                                    ek = extra.get("sessionUpdate")
+                                    if ek == "agent_message_chunk":
+                                        ec = extra.get("content") or {}
+                                        if (ec.get("type") == "text"
+                                                and ec.get("text")):
+                                            yield ("text", ec["text"])
+                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                            pass
+                        abnormal = False
                         return
                     update = pending_get.result()
                     pending_get = asyncio.ensure_future(updates.get())
@@ -437,16 +497,23 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                                     res = progress_cb("read %s" % title)
                                     if res is not None:
                                         await res
+                                except (ConnectionResetError,
+                                        asyncio.CancelledError):
+                                    raise
                                 except Exception:
                                     pass
                         else:
-                            tool_active = True
-                            yield ("alien_tool", title)
+                            raise AcpError(
+                                "alien_tool_frame:%s: server executed a native "
+                                "tool; results never reach the client"
+                                % (title or "unknown"))
                     elif kind == "usage_update":
                         try:
                             used = int(update.get("used") or 0)
                         except Exception:
                             used = 0
+                        if used:
+                            _AFF_USE[sid] = max(_AFF_USE.get(sid, 0), used)
                         if used - last_usage_logged >= USAGE_LOG_STEP:
                             last_usage_logged = used
                             _log("turn progress: %dk tokens so far" % (used // 1000))
@@ -456,13 +523,15 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                                         "%dk tokens so far" % (used // 1000))
                                     if res is not None:
                                         await res
+                                except (ConnectionResetError,
+                                        asyncio.CancelledError):
+                                    raise
                                 except Exception:
                                     pass
                     # ignore: available_commands_update, etc.
             finally:
                 if not pending_get.done():
                     pending_get.cancel()
-                abnormal = not prompt_task.done()
                 if abnormal:
                     # Abnormal exit: tell the server to STOP WORK.
                     prompt_task.cancel()
@@ -473,8 +542,11 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                         pass
                 if abnormal:
                     # Failed turn: poison would linger server-side. Close and
-                    # forget so the next turn starts clean.
-                    if shared:
+                    # forget so the next turn starts clean -- but only if the
+                    # mapping is still ours (a concurrent fallback may have
+                    # published a replacement).
+                    if shared and (_AFFINITY.get(aff_key) or {}).get(
+                            "sid") == sid:
                         drop_affinity(aff_key)
                     try:
                         await acp.request("session/close", {"sessionId": sid},
@@ -484,7 +556,7 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                 elif aff_key is not None:
                     # Healthy turn with a conversation key: keep the session,
                     # record how many messages the server has seen.
-                    mark_sent(aff_key, sid, aff_count, model)
+                    mark_sent(aff_key, sid, aff_count, model, aff_pfx)
                 else:
                     # No key (direct collect callers): one-shot, close it.
                     try:
