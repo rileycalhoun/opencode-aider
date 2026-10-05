@@ -41,6 +41,7 @@ OPENCODE_CLI = os.environ.get(
 # Transient CLI failures worth a retry: the step watchdog aborts (often after a
 # permission prompt stalled), read timeouts, connection resets.
 TRANSIENT_RE = re.compile(r"interrupt|abort|timeout|econn|reset|timed out", re.I)
+NARRATE_RE = re.compile(r"tool protocol|fenced block|only.*block|emit.*block", re.I)
 DEFAULT_MODEL = "longcat-2.5-preview-free"
 
 FREE_MODELS = [
@@ -113,6 +114,12 @@ Rules:
   block. They are executed in parallel.
 - Use EXACT tool names as written below.
 - When you already have everything you need, reply with plain prose and NO block.
+
+Completed example (real call — copy this shape exactly, with a real tool name):
+
+<tool_call>
+{"name": "get_items", "arguments": {}}
+</tool_call>
 """
 
 
@@ -429,6 +436,13 @@ async def collect(model, prompt, stream_cb=None, log=None):
                 tool_raw.append(seg)
 
         calls = parse_tool_block("".join(tool_raw))
+        if not calls and not alien and attempt < 2 and NARRATE_RE.search("".join(text_parts)):
+            # Model talked about the protocol instead of using it. Correct it.
+            prompt = (prompt + "\n\n[system] Your last response talked about the tool "
+                      "protocol instead of using it. Do not explain or narrate. Either "
+                      "emit ONLY the fenced <tool_call> block, or reply with plain "
+                      "prose and no block.")
+            continue
         if calls or not alien or attempt == 2:
             return "".join(text_parts), calls, alien
         # The model tried a tool that does not exist in the client. Correct it.
