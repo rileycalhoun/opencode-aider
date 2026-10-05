@@ -697,8 +697,11 @@ async def handle_chat(request):
         async def on_text(seg):
             await send(chunk(cid, model, delta={"content": seg}))
 
+        _want_progress = (request.headers.get("X-Shim-Progress") == "1")
+
         async def on_progress(msg):
-            await send(": [shim: %s]" % msg)
+            if _want_progress:
+                await send(": [shim: %s]" % msg)
 
         text, calls, alien, attempts = await collect(
             model, prompt, stream_cb=on_text, progress_cb=on_progress,
@@ -706,9 +709,10 @@ async def handle_chat(request):
             affinity=affinity)
         for payload in tool_call_chunks(cid, model, calls):
             await send(payload)
-        await send(": [shim: prompt=%dch alien=%s attempts=%d]"
-                   % (len(prompt), ",".join(sorted(set(alien))) or "none",
-                      attempts))
+        if _want_progress:
+            await send(": [shim: prompt=%dch alien=%s attempts=%d]"
+                       % (len(prompt), ",".join(sorted(set(alien))) or "none",
+                          attempts))
         await send(chunk(cid, model, finish="tool_calls" if calls else "stop"))
         await send("[DONE]")
         await resp.write_eof()
