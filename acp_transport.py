@@ -247,13 +247,10 @@ class AcpProcess:
         fut = loop.create_future()
         self._pending[mid] = fut
         try:
-            try:
-                await asyncio.wait_for(
-                    self._send_raw({"jsonrpc": "2.0", "id": mid,
-                                    "method": method, "params": params}),
-                    timeout=30)
-            except (Exception, asyncio.CancelledError):
-                raise
+            await asyncio.wait_for(
+                self._send_raw({"jsonrpc": "2.0", "id": mid,
+                                "method": method, "params": params}),
+                timeout=30)
             return await asyncio.wait_for(fut, timeout)
         finally:
             self._pending.pop(mid, None)
@@ -311,7 +308,8 @@ def mark_sent(key, sid, count, model, pfx=None):
         _orphan(prev["sid"])  # displaced idle mapping: close it
     idle_keys = [k for k in _AFFINITY
                  if k != key and not _AFFINITY[k].get("busy")]
-    while len(_AFFINITY) >= _AFFINITY_MAX and idle_keys:
+    while (len(_AFFINITY) >= _AFFINITY_MAX and key not in _AFFINITY
+           and idle_keys):
         oldest = min(idle_keys, key=lambda k: _AFFINITY[k]["last"])
         idle_keys.remove(oldest)
         old = _AFFINITY.pop(oldest, None)
@@ -373,7 +371,10 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
     # busy, idle, or model-mismatched server state unclear -> fall back safe.
     aff_key = aff_delta = aff_count = aff_check = aff_store = None
     aff_entry = None
-    bridged_ids = set()
+    try:
+        await reap_orphans(acp)
+    except asyncio.CancelledError:
+        raise
     if affinity:
         aff_key = affinity[0]
         aff_delta = affinity[1] if len(affinity) > 1 else ""
@@ -409,7 +410,6 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
     ok = True
     abnormal = True  # safe default: early failure forgets session state
     try:
-        await reap_orphans(acp)
         if not shared:
             # No MCP servers, ever: only fenced client tools exist here.
             # (MCP_BRIDGE_* kept for debugging; do not re-enable without
@@ -510,19 +510,11 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                                 return None
                             if ek not in ("tool_call", "tool_call_update"):
                                 return None
-                            title = frame.get("title") or ""
-                            cid = frame.get("toolCallId") or ""
-                            if cid and cid in bridged_ids:
-                                return None
-                            if (title == MCP_BRIDGE_NAME or title.startswith(
-                                    MCP_BRIDGE_NAME + "_")):
-                                if cid:
-                                    bridged_ids.add(cid)
-                                return None
+                            title = frame.get("title") or "unknown"
                             raise AcpError(
                                 "alien_tool_frame:%s: server executed "
                                 "a native tool; results never reach "
-                                "the client" % (title or "unknown"))
+                                "the client" % title)
 
                         if pending_get.done() and not pending_get.cancelled():
                             try:
