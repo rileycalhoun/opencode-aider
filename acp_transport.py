@@ -44,7 +44,9 @@ import os
 OPENCODE_BIN = os.environ.get("OPENCODE_CLI", "/usr/local/bin/opencode")
 ACP_HOME = "/home/opencode/.cache/acp-home"
 ACP_AUTH_SRC = "/home/opencode/.local/share/opencode/auth.json"
-IDLE_TIMEOUT = 300  # abort a turn silent this long (matches retry classifier)
+IDLE_TIMEOUT = 300  # base: abort a turn silent this long (matches retry classifier)
+IDLE_TIMEOUT_FIRST = 600  # pre-first-frame: giant prompts are slow to start
+IDLE_TIMEOUT_TOOL = 900  # tool inflight: ACP sends nothing during execution
 TURN_TIMEOUT = 1200  # hard ceiling per turn (20 min)
 MAX_TURNS_PER_PROC = 25  # recycle the shared proc past this many turns
 STDERR_RING = 200  # agent stderr lines kept for failure dumps
@@ -260,6 +262,10 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME):
     acp._active += 1
     acp._turns += 1
     last_usage_logged = 0
+    turn_start = asyncio.get_event_loop().time()
+    frames_seen = 0
+    last_frame_kind = "none"
+    tool_active = False  # set on tool_call, cleared on text (ACP is silent mid-tool)
     try:
         resp = await acp.request("session/new",
                                  {"cwd": workdir, "mcpServers": []})
@@ -280,13 +286,22 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME):
             pending_get = asyncio.ensure_future(updates.get())
             try:
                 while True:
+                    if tool_active:
+                        idle = IDLE_TIMEOUT_TOOL
+                    elif frames_seen == 0:
+                        idle = IDLE_TIMEOUT_FIRST
+                    else:
+                        idle = IDLE_TIMEOUT
                     done, _ = await asyncio.wait(
                         [pending_get, prompt_task],
                         return_when=asyncio.FIRST_COMPLETED,
-                        timeout=IDLE_TIMEOUT)
+                        timeout=idle)
                     if not done:
                         raise AcpError(
-                            "acp turn timeout: idle too long without frames")
+                            "acp turn timeout: idle too long without frames "
+                            "(idle %.0fs, elapsed %.0fs, frames %d, last %s, tool_active %s)"
+                            % (idle, asyncio.get_event_loop().time() - turn_start,
+                               frames_seen, last_frame_kind, tool_active))
                     if prompt_task in done:
                         try:
                             resp = prompt_task.result()
@@ -300,15 +315,19 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME):
                         return
                     update = pending_get.result()
                     pending_get = asyncio.ensure_future(updates.get())
+                    frames_seen += 1
                     if isinstance(update, dict) and update.get("__acp_dead__"):
                         raise AcpError("acp process died mid-turn (aborted)")
                     kind = update.get("sessionUpdate")
+                    last_frame_kind = kind
                     if kind == "agent_message_chunk":
                         content = update.get("content") or {}
                         if (content.get("type") == "text"
                                 and content.get("text")):
+                            tool_active = False  # model spoke: prior tool done
                             yield ("text", content["text"])
                     elif kind in ("tool_call", "tool_call_update"):
+                        tool_active = True
                         yield ("alien_tool",
                                update.get("title") or "unknown")
                     elif kind == "usage_update":
