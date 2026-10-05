@@ -343,7 +343,15 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME):
                 if not pending_get.done():
                     pending_get.cancel()
                 if not prompt_task.done():
+                    # Abnormal exit (disconnect/timeout/cancel): tell the
+                    # server to STOP WORK, not just stop listening. Cancelling
+                    # our wait-future alone leaves the turn running blind.
                     prompt_task.cancel()
+                    try:
+                        await acp.request("session/cancel",
+                                          {"sessionId": sid}, timeout=10)
+                    except Exception:
+                        pass
                 try:
                     await acp.request("session/close", {"sessionId": sid},
                                       timeout=10)

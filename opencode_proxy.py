@@ -407,8 +407,9 @@ async def collect(model, prompt, stream_cb=None, log=None):
         sp = Splitter()
         text_parts, tool_raw = [], []
         alien = []
+        gen = acp_turn_events(model, prompt)
         try:
-            async for ev, payload in acp_turn_events(model, prompt):
+            async for ev, payload in gen:
                 if ev == "text":
                     for kind, seg in sp.feed(payload):
                         if kind == "text":
@@ -425,6 +426,15 @@ async def collect(model, prompt, stream_cb=None, log=None):
                 if stream_cb:
                     await stream_cb(f"\n[shim: turn transport failed ({e}); retrying turn]\n")
                 continue
+            raise
+        except (ConnectionResetError, asyncio.CancelledError):
+            # Client went away (stop button / disconnect): close the turn
+            # generator so its finally sends session/cancel + session/close.
+            # Without this the server runs the full 20min ceiling blind.
+            try:
+                await gen.aclose()
+            except Exception:
+                pass
             raise
         for kind, seg in sp.flush():
             if kind == "text":
