@@ -453,6 +453,9 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                     try:
                         await acp.request("session/close",
                                           {"sessionId": sid}, timeout=10)
+                    except asyncio.CancelledError:
+                        _orphan(sid)
+                        raise
                     except Exception:
                         pass
                     if shared and (_AFFINITY.get(aff_key) or {}).get(
@@ -462,8 +465,25 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
             send_text = prompt_text
             if shared and aff_delta:
                 send_text = aff_delta  # follow-up: only what's new
-            # Empty delta: re-send full text into the SAME session (re-sync),
-            # keep the mapping.
+            elif shared:
+                # Raced entry (busy at peek, idle now) with nothing new:
+                # full text into a live session would duplicate context.
+                _orphan(aff_entry["sid"])
+                drop_affinity(aff_key)
+                aff_entry = None
+                shared = False
+                sid = None
+                resp = await acp.request("session/new",
+                                         {"cwd": workdir, "mcpServers": []})
+                sid = (resp.get("result") or {}).get("sessionId")
+                if not sid:
+                    raise AcpError("session/new gave no sessionId: %s"
+                                   % json.dumps(resp)[:200])
+                updates = acp.session_queue(sid)
+                await acp.request("session/set_config_option",
+                                  {"sessionId": sid, "configId": "model",
+                                   "value": "opencode/" + model})
+                send_text = prompt_text
             prompt_task = asyncio.ensure_future(acp.request(
                 "session/prompt",
                 {"sessionId": sid, "prompt": [
@@ -544,6 +564,7 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                         else:
                             if not pending_get.done():
                                 pending_get.cancel()
+                        died = False
                         try:
                             while (asyncio.get_event_loop().time()
                                    < drain_end):
@@ -554,11 +575,23 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                                 except asyncio.TimeoutError:
                                     break
                                 frames_seen += 1
-                                t = await _drain_text(extra)
+                                try:
+                                    t = await _drain_text(extra)
+                                except AcpError as _de:
+                                    if "died mid-turn" in str(_de):
+                                        # Answer complete, process dead:
+                                        # keep text, no retry (retry would
+                                        # double-stream it), drop mapping.
+                                        died = True
+                                        break
+                                    raise
                                 if t:
                                     yield ("text", t)
                         except asyncio.CancelledError:
                             raise
+                        if died:
+                            abnormal = True
+                            return
                         abnormal = False
                         return
                     update = pending_get.result()
@@ -614,6 +647,14 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                     try:
                         await acp.request("session/cancel",
                                           {"sessionId": sid}, timeout=10)
+                    except asyncio.CancelledError:
+                        _orphan(sid)
+                        try:
+                            await acp.request("session/close",
+                                              {"sessionId": sid}, timeout=10)
+                        except Exception:
+                            pass
+                        raise
                     except Exception:
                         pass
                 if abnormal:

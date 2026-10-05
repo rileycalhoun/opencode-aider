@@ -632,6 +632,9 @@ async def collect(model, prompt, stream_cb=None, log=None,
                 affinity = None  # fresh session, not a duplicate re-send
                 continue
             if attempt < 2 and TRANSIENT_RE.search(msg):
+                if time.monotonic() >= deadline - 30:
+                    raise
+                _drop_if_idle(affinity[0] if affinity else None)
                 if stream_cb:
                     await stream_cb(f"\n[shim: turn transport failed ({e}); retrying turn]\n")
                 affinity = None
@@ -892,9 +895,6 @@ async def handle_chat(request):
         # Nothing new, or too much new: drop the old mapping, then
         # map a FRESH session under the SAME key with the full prompt,
         # so the next turn resumes deltas.
-        # Drop the old mapping and start a FRESH mapped session
-        # with the full prompt, so the NEXT turn resumes deltas
-        # instead of full-resending forever.
         _drop_if_idle(_akey)
         affinity = (_akey, "", len(_msgs), None, _store)
     else:
