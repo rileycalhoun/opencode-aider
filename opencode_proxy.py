@@ -40,7 +40,7 @@ OPENCODE_CLI = os.environ.get(
 # (see acp_transport.ensure_acp_home), not a scratch cwd.
 # Transient CLI failures worth a retry: the step watchdog aborts (often after a
 # permission prompt stalled), read timeouts, connection resets.
-TRANSIENT_RE = re.compile(r"interrupt|abort|timeout|econn|reset|timed out", re.I)
+TRANSIENT_RE = re.compile(r"interrupt|abort|timeout|econn|reset|timed out|prompt failed", re.I)
 NARRATE_RE = re.compile(r"tool protocol|fenced block|only.*block|emit.*block", re.I)
 MAX_PROMPT_CHARS = 60000  # ceiling for flattened convo; head elided past this
 TOOL_DESC_LIMIT = 200  # per-tool description chars kept in catalogue
@@ -270,8 +270,12 @@ def affinity_key_for(model, body, header_key=None):
         if m.get("role") == "system")[:2000]
     first_user = next((m for m in msgs if m.get("role") == "user"), {})
     first_text = _content_to_text(first_user.get("content"))[:2000]
+    tool_sig = ",".join(
+        sorted(str(((t.get("function") or {}).get("name") or ""))
+               for t in (body.get("tools") or [])))[:500]
     return "h:" + _hl.sha1(
-        (model + "|" + sys_text + "|" + first_text).encode()).hexdigest()[:16]
+        (model + "|" + sys_text + "|" + first_text + "|" + tool_sig).encode()
+    ).hexdigest()[:16]
 
 
 def build_prompt(body):
@@ -284,6 +288,9 @@ def build_prompt(body):
         tools = [t for t in tools
                  if ((t.get("function") or {}).get("name") == forced)] or tools
     parts = []
+    if not tools:
+        parts.append("You have no tools in this turn. Answer in plain "
+                     "prose; never reach for built-in tools.")
     if tools and render_catalogue:
         model_name = (body.get("model") or "").lower()
         proto = PROTOCOL_SPARK if "muse-spark" in model_name else PROTOCOL
@@ -334,11 +341,8 @@ class Splitter:
                     self.buf = self.buf[i + len(CLOSE_FENCE):]
                     self.in_tool = False
                     continue
-                keep = _partial_suffix_len(self.buf, CLOSE_FENCE)
-                if len(self.buf) > keep:
-                    cut = len(self.buf) - keep
-                    yield ("tool", self.buf[:cut])
-                    self.buf = self.buf[cut:]
+                # No partial yields: a tool body only counts whole, at the
+                # closing fence. Streaming fragments can never become calls.
                 return
             i = self.buf.find(OPEN_FENCE)
             if i >= 0:
@@ -387,13 +391,22 @@ def parse_tool_block(raw):
             lines = lines[:-1]
         s = "\n".join(lines)
     dec = json.JSONDecoder()
+    skipped_prefix = False
     while s.strip():
-        s = s.strip()
+        s = s.strip().lstrip(",")
+        if not s:
+            break
         if s[0] != "{":
+            if skipped_prefix:
+                print("[proxy] parse: stopping at non-object text: %s"
+                      % s[:80], flush=True)
+                break
             i = s.find("{")
             if i < 0:
                 break
             s = s[i:]
+            skipped_prefix = True
+            continue
         try:
             obj, end = dec.raw_decode(s)
         except json.JSONDecodeError:
@@ -499,23 +512,36 @@ async def collect(model, prompt, stream_cb=None, log=None,
         gen = acp_turn_events(model, prompt, progress_cb=progress,
                               affinity=affinity, turn_timeout=use_timeout)
         try:
-            async for ev, payload in gen:
-                if ev == "text":
-                    for kind, seg in sp.feed(payload):
-                        if kind == "text":
-                            text_parts.append(seg)
-                            note_text()
-                            if stream_cb:
-                                await stream_cb(seg)
-                        else:
-                            tool_raw.append(seg)
-                elif ev == "alien_tool":
-                    # Transport raises on tool frames instead (cancel path);
-                    # this survives only for direct collect() callers.
-                    alien.append(payload)
-                    await progress("executing %s\u2026" % payload)
+            async with asyncio.timeout(max(1, remaining)):
+                async for ev, payload in gen:
+                    if ev == "text":
+                        for kind, seg in sp.feed(payload):
+                            if kind == "text":
+                                text_parts.append(seg)
+                                note_text()
+                                if stream_cb:
+                                    await stream_cb(seg)
+                            else:
+                                tool_raw.append(seg)
+                    elif ev == "alien_tool":
+                        # Transport raises on tool frames instead (cancel path);
+                        # this survives only for direct collect() callers.
+                        alien.append(payload)
+                        await progress("executing %s\u2026" % payload)
+        except TimeoutError:
+            try:
+                await gen.aclose()
+            except Exception:
+                pass
+            raise AcpError("attempt exceeded remaining request budget")
         except (ShimError, AcpError) as e:
             msg = str(e)
+            if "alien_tool_frame:" in msg and not (enforce and enforce[0]):
+                # No fenced tools exist in this turn: prose is the only
+                # useful output. Keep what streamed, no error.
+                if log:
+                    log("alien with tools=0: returning prose")
+                return "".join(text_parts), [], [], attempt + 1
             if ("alien_tool_frame:" in msg and not corrected
                     and attempt < 2):
                 aname = msg.split(":", 2)[1] if msg.count(":") >= 2 else "?"
@@ -552,6 +578,11 @@ async def collect(model, prompt, stream_cb=None, log=None,
                 tool_raw.append(seg)
 
         calls = parse_tool_block("".join(tool_raw))
+        _req = enforce[1] if enforce else None
+        if enforce:
+            _req = enforce[1] if len(enforce) > 1 else None
+            if enforce[2]:
+                _req = _req or "*any*"
         if enforce and calls:
             offered, forced, none_flag = enforce
             if none_flag:
@@ -567,6 +598,17 @@ async def collect(model, prompt, stream_cb=None, log=None,
                     log("dropping %d unenforced calls"
                         % (len(calls) - len(kept)))
                 calls = kept
+        if (_req and not calls and not corrected and attempt < 2):
+            prompt = (prompt + "\n\n[system] You MUST emit the fenced "
+                      "<tool_call> block this turn" +
+                      ("" if _req == "*any*" else " for `%s`" % _req) +
+                      ". Plain prose is not acceptable. Judge only the "
+                      "final answer; prior attempts are superseded.")
+            corrected = True
+            affinity = None
+            continue
+        if _req and not calls:
+            raise ShimError("required tool %s produced no call" % _req)
         if not calls and not alien and attempt < 2 and NARRATE_RE.search("".join(text_parts)):
             # Model talked about the protocol instead of using it. Correct it.
             prompt = (prompt + "\n\n[system] Your last response talked about the tool "
@@ -667,47 +709,48 @@ async def handle_direct(request, body, model):
             {"error": {"message": "zen unreachable: %s" % e,
                        "type": "server_error"}}, status=502)
     try:
-        upstream = await session.post(
-            ZEN_API_URL + "/chat/completions",
-            headers=headers, json=body)
-    except Exception as e:
-        await session.close()
-        return web.json_response(
-            {"error": {"message": "zen unreachable: %s" % e,
-                       "type": "server_error"}}, status=502)
-    if body.get("stream"):
-        resp = web.StreamResponse(status=upstream.status, headers={
-            "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
-            "Connection": "keep-alive", "X-Accel-Buffering": "no"})
-        await resp.prepare(request)
         try:
-            async for chunk_bytes in upstream.content.iter_any():
-                if chunk_bytes:
-                    await resp.write(chunk_bytes)
-            await resp.write_eof()
-        except (ConnectionResetError, asyncio.CancelledError):
-            pass
+            upstream = await session.post(
+                ZEN_API_URL + "/chat/completions",
+                headers=headers, json=body)
         except Exception as e:
-            print("[proxy] direct stream error: %s" % e, flush=True)
+            return web.json_response(
+                {"error": {"message": "zen unreachable: %s" % e,
+                           "type": "server_error"}}, status=502)
+        if body.get("stream"):
+            resp = web.StreamResponse(status=upstream.status, headers={
+                "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
+                "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+            await resp.prepare(request)
             try:
+                async for chunk_bytes in upstream.content.iter_any():
+                    if chunk_bytes:
+                        await resp.write(chunk_bytes)
                 await resp.write_eof()
-            except Exception:
+            except (ConnectionResetError, asyncio.CancelledError):
                 pass
+            except Exception as e:
+                print("[proxy] direct stream error: %s" % e, flush=True)
+                try:
+                    await resp.write_eof()
+                except Exception:
+                    pass
+            finally:
+                await upstream.release()
+            print("[proxy] direct %s streamed done" % model, flush=True)
+            return resp
+        try:
+            payload = await upstream.json()
+        except Exception as e:
+            return web.json_response(
+                {"error": {"message": "zen bad reply: %s" % e,
+                           "type": "server_error"}}, status=502)
         finally:
             await upstream.release()
-            await session.close()
-        print("[proxy] direct %s streamed done" % model, flush=True)
-        return resp
-    try:
-        payload = await upstream.json()
-    except Exception as e:
-        return web.json_response(
-            {"error": {"message": "zen bad reply: %s" % e,
-                       "type": "server_error"}}, status=502)
+        return web.json_response(payload, status=upstream.status)
     finally:
-        await upstream.release()
         await session.close()
-    return web.json_response(payload, status=upstream.status)
+
 
 
 # ── handlers ─────────────────────────────────────────────────────────────────
@@ -750,14 +793,17 @@ async def handle_chat(request):
     _akey = affinity_key_for(
         model, body, request.headers.get("X-Shim-Session"))
     _sent = _peek(_akey)
+    _msgs = body.get("messages", [])
+    _full_flat = flatten_history(_msgs)
+    import hashlib as _hl3
+    _store = _hl3.sha1(_full_flat.encode()).hexdigest()[:16]
     if _sent is not None:
-        import hashlib as _hl3
-        _prior = flatten_history(body.get("messages", [])[:_sent])
-        _pfx = _hl3.sha1(_prior.encode()).hexdigest()[:16]
-        _delta = flatten_history(body.get("messages", [])[_sent:])
-        affinity = (_akey, _delta, len(body.get("messages", [])), _pfx)
+        _prior = flatten_history(_msgs[:_sent])
+        _check = _hl3.sha1(_prior.encode()).hexdigest()[:16]
+        _delta = flatten_history(_msgs[_sent:])
+        affinity = (_akey, _delta, len(_msgs), _check, _store)
     else:
-        affinity = (_akey, "", len(body.get("messages", [])), None)
+        affinity = (_akey, "", len(_msgs), None, _store)
     print(f"[proxy] {requested}->{model} {len(prompt)}ch "
           f"{'stream' if stream else 'block'} tools={ntools}", flush=True)
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]

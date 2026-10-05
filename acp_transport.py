@@ -193,7 +193,7 @@ class AcpProcess:
                     _log("dropped malformed stdout line (total %d)"
                          % self._drop_parse)
                     continue
-                await self._dispatch(obj)
+                await self._dispatch(obj, proc)
         except Exception as e:
             _log("reader loop ended: %s" % e)
         finally:
@@ -201,7 +201,9 @@ class AcpProcess:
                 self._fail_all(AcpError("acp process died"))
                 self.proc = None
 
-    async def _dispatch(self, obj):
+    async def _dispatch(self, obj, proc):
+        if proc is not self.proc:
+            return  # stale reader: never touch the replacement's state
         if not isinstance(obj, dict):
             return
         if "id" in obj and ("result" in obj or "error" in obj):
@@ -244,8 +246,14 @@ class AcpProcess:
         loop = asyncio.get_event_loop()
         fut = loop.create_future()
         self._pending[mid] = fut
-        await self._send_raw({"jsonrpc": "2.0", "id": mid,
-                              "method": method, "params": params})
+        try:
+            await asyncio.wait_for(
+                self._send_raw({"jsonrpc": "2.0", "id": mid,
+                                "method": method, "params": params}),
+                timeout=30)
+        except Exception:
+            self._pending.pop(mid, None)
+            raise
         try:
             return await asyncio.wait_for(fut, timeout)
         finally:
@@ -287,7 +295,7 @@ def peek_sent(key):
     import time as _t
     if _t.monotonic() - e["last"] > _AFFINITY_IDLE:
         _AFFINITY.pop(key, None)
-        _AFF_ORPHANS.append(e["sid"])  # idle-evicted: must be closed
+        _orphan(e["sid"])  # idle-evicted: must be closed
         return None
     import time as _t
     if _t.monotonic() - e["last"] > _AFFINITY_IDLE:
@@ -301,28 +309,36 @@ def mark_sent(key, sid, count, model, pfx=None):
     import time as _t
     prev = _AFFINITY.get(key)
     if prev is not None and prev.get("sid") != sid:
-        _AFF_ORPHANS.append(prev["sid"])  # displaced mapping: close it
+        _orphan(prev["sid"])  # displaced mapping: close it
     while len(_AFFINITY) >= _AFFINITY_MAX and key not in _AFFINITY:
         oldest = min(_AFFINITY, key=lambda k: _AFFINITY[k]["last"])
         old = _AFFINITY.pop(oldest, None)
         if old is not None:
-            _AFF_ORPHANS.append(old["sid"])
+            _orphan(old["sid"])
     _AFFINITY[key] = {"sid": sid, "sent": count, "last": _t.monotonic(),
                       "busy": False, "model": model, "pfx": pfx}
+
+
+def _orphan(sid):
+    if sid and sid not in _AFF_ORPHANS:
+        _AFF_ORPHANS.append(sid)
 
 
 def drop_affinity(key):
     e = _AFFINITY.pop(key, None)
     if e is not None:
-        _AFF_ORPHANS.append(e["sid"])
+        _orphan(e["sid"])
 
 
-async def reap_orphans(acp):
-    while _AFF_ORPHANS:
+async def reap_orphans(acp, limit=2):
+    live = set(acp._sessions) | {e["sid"] for e in _AFFINITY.values()}
+    for dead in [k for k in _AFF_USE if k not in live]:
+        _AFF_USE.pop(dead, None)
+    for _ in range(min(limit, len(_AFF_ORPHANS))):
         sid = _AFF_ORPHANS.pop(0)
         try:
             await acp.request("session/close", {"sessionId": sid},
-                              timeout=10)
+                              timeout=3)
         except Exception:
             pass
         acp.forget_session(sid)
@@ -348,26 +364,31 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
     last_usage_logged = 0
     # affinity: (key, delta_text, full_count). Fresh session when key unknown,
     # busy, idle, or model-mismatched server state unclear -> fall back safe.
-    aff_key = aff_delta = aff_count = aff_pfx = None
+    aff_key = aff_delta = aff_count = aff_check = aff_store = None
     aff_entry = None
     bridged_ids = set()
-    await reap_orphans(acp)
     if affinity:
-        aff_key, aff_delta, aff_count = affinity[0], affinity[1], affinity[2]
-        aff_pfx = affinity[3] if len(affinity) > 3 else None
+        aff_key = affinity[0]
+        aff_delta = affinity[1] if len(affinity) > 1 else ""
+        aff_count = affinity[2] if len(affinity) > 2 else 0
+        aff_check = affinity[3] if len(affinity) > 3 else None
+        aff_store = affinity[4] if len(affinity) > 4 else None
         aff_entry = _AFFINITY.get(aff_key)
         if aff_entry is not None:
             import time as _t
-            if (aff_entry["busy"]
-                    or _t.monotonic() - aff_entry["last"] > _AFFINITY_IDLE
-                    or aff_entry["sid"] not in acp._sessions
-                    or (aff_pfx is not None
-                        and aff_entry.get("pfx") is not None
-                        and aff_entry["pfx"] != aff_pfx)
-                    or _AFF_USE.get(aff_entry["sid"], 0) > AFF_USE_CAP):
-                # Busy, idle, gone, foreign conversation, or overgrown:
-                # never reuse. Orphan the sid for reaping.
-                _AFF_ORPHANS.append(aff_entry["sid"])
+            stale = (
+                _t.monotonic() - aff_entry["last"] > _AFFINITY_IDLE
+                or aff_entry["sid"] not in acp._sessions
+                or (aff_check is not None
+                    and aff_entry.get("pfx") is not None
+                    and aff_entry["pfx"] != aff_check)
+                or _AFF_USE.get(aff_entry["sid"], 0) > AFF_USE_CAP)
+            if aff_entry["busy"]:
+                # Still running elsewhere: NEVER touch its session.
+                # Fall through to a fresh turn; leave mapping alone.
+                aff_entry = None
+            elif stale:
+                _orphan(aff_entry["sid"])
                 drop_affinity(aff_key)
                 aff_entry = None
         if aff_entry is not None:
@@ -381,6 +402,7 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
     ok = True
     abnormal = True  # safe default: early failure forgets session state
     try:
+        await reap_orphans(acp)
         if not shared:
             # No MCP servers, ever: only fenced client tools exist here.
             # (MCP_BRIDGE_* kept for debugging; do not re-enable without
@@ -400,9 +422,21 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
             # drops in the log).
             updates = acp.session_queue(sid)
             if not shared or aff_entry.get("model") != model:
-                await acp.request("session/set_config_option",
-                                  {"sessionId": sid, "configId": "model",
-                                   "value": "opencode/" + model})
+                try:
+                    await acp.request("session/set_config_option",
+                                      {"sessionId": sid, "configId": "model",
+                                       "value": "opencode/" + model})
+                except Exception:
+                    abnormal = True
+                    try:
+                        await acp.request("session/close",
+                                          {"sessionId": sid}, timeout=10)
+                    except Exception:
+                        pass
+                    if shared and (_AFFINITY.get(aff_key) or {}).get(
+                            "sid") == sid:
+                        drop_affinity(aff_key)
+                    raise
             send_text = prompt_text
             if shared and aff_delta:
                 send_text = aff_delta  # follow-up: only what's new
@@ -444,22 +478,70 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                             abnormal = True
                             raise AcpError("prompt refused: %s"
                                            % json.dumps(resp["error"])[:200])
-                        # Linger-drain: trailing frames already queued (final
-                        # text chunks) must not be dropped with the return.
+                        stop = ((resp.get("result") or {}).get("stopReason")
+                                if isinstance(resp, dict) else None)
+                        if stop in ("cancelled", "refused"):
+                            abnormal = True
+                            raise AcpError("turn ended %s without content"
+                                           % stop)
+                        # Linger-drain: harvest frames already in flight
+                        # (final text), with a hard total cap. Tool frames
+                        # stay fatal; disconnect propagates (abnormal kept).
+                        drain_end = asyncio.get_event_loop().time() + 3.0
+
+                        async def _drain_text(frame):
+                            # Returns drainable text or None. Tool frames
+                            # raise (fatal); disconnect propagates.
+                            if not isinstance(frame, dict):
+                                return None
+                            ek = frame.get("sessionUpdate")
+                            if ek == "agent_message_chunk":
+                                ec = frame.get("content") or {}
+                                if (ec.get("type") == "text"
+                                        and ec.get("text")):
+                                    return ec["text"]
+                                return None
+                            if ek not in ("tool_call", "tool_call_update"):
+                                return None
+                            title = frame.get("title") or ""
+                            cid = frame.get("toolCallId") or ""
+                            if cid and cid in bridged_ids:
+                                return None
+                            if (title == MCP_BRIDGE_NAME or title.startswith(
+                                    MCP_BRIDGE_NAME + "_")):
+                                if cid:
+                                    bridged_ids.add(cid)
+                                return None
+                            raise AcpError(
+                                "alien_tool_frame:%s: server executed "
+                                "a native tool; results never reach "
+                                "the client" % (title or "unknown"))
+
+                        if pending_get.done() and not pending_get.cancelled():
+                            try:
+                                t = await _drain_text(pending_get.result())
+                            except asyncio.CancelledError:
+                                raise
+                            if t:
+                                yield ("text", t)
+                        else:
+                            if not pending_get.done():
+                                pending_get.cancel()
                         try:
-                            while True:
-                                extra = await asyncio.wait_for(
-                                    updates.get(), timeout=1.5)
+                            while (asyncio.get_event_loop().time()
+                                   < drain_end):
+                            # bounded gap wait inside a bounded total
+                                try:
+                                    extra = await asyncio.wait_for(
+                                        updates.get(), timeout=0.5)
+                                except asyncio.TimeoutError:
+                                    break
                                 frames_seen += 1
-                                if isinstance(extra, dict):
-                                    ek = extra.get("sessionUpdate")
-                                    if ek == "agent_message_chunk":
-                                        ec = extra.get("content") or {}
-                                        if (ec.get("type") == "text"
-                                                and ec.get("text")):
-                                            yield ("text", ec["text"])
-                        except (asyncio.TimeoutError, asyncio.CancelledError):
-                            pass
+                                t = await _drain_text(extra)
+                                if t:
+                                    yield ("text", t)
+                        except asyncio.CancelledError:
+                            raise
                         abnormal = False
                         return
                     update = pending_get.result()
@@ -556,7 +638,7 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                 elif aff_key is not None:
                     # Healthy turn with a conversation key: keep the session,
                     # record how many messages the server has seen.
-                    mark_sent(aff_key, sid, aff_count, model, aff_pfx)
+                    mark_sent(aff_key, sid, aff_count, model, aff_store)
                 else:
                     # No key (direct collect callers): one-shot, close it.
                     try:

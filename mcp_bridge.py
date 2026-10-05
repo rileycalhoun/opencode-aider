@@ -98,6 +98,15 @@ def t_grep(a):
                 continue
             fp = os.path.join(dirpath, fn)
             try:
+                _resolve(fp)  # symlink escape: confined like file_read
+            except ValueError:
+                continue
+            try:
+                if os.path.getsize(fp) > 2000000:
+                    continue  # no unbounded scans
+            except OSError:
+                continue
+            try:
                 with open(fp, "r", encoding="utf-8", errors="replace") as f:
                     for i, line in enumerate(f, 1):
                         if rx.search(line):

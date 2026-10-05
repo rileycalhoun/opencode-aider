@@ -50,15 +50,18 @@ for size in (1, 3, 7, 100):
        not any(k == "tool" for k, _ in got))
 
 print("=== splitter: literal '<' and near-miss fences ===")
-for payload in ["a < b", "x <hermes_tool_c", "no fence </tool_call> here",
-                "<<tool_call>>"]:
+for payload in ["a < b", "x <hermes_tool_c", "no fence </tool_call> here"]:
     chunks = [payload[i:i+2] for i in range(0, len(payload), 2)]
     got = split_all(chunks)
     txt = "".join(s for k, s in got if k == "text")
     tool = "".join(s for k, s in got if k == "tool")
     # Nothing should be lost; a stray close fence with no open stays prose.
-    ok(f"no data loss @ {payload[:24]!r}", (txt + tool) == payload or tool != "",
+    ok(f"no data loss @ {payload[:24]!r}", (txt + tool) == payload,
        f"txt={txt!r} tool={tool!r}")
+# An UNCLOSED fence is dropped (logged), never parsed into a call.
+got = split_all(["<<tool_call>>"[i:i+2] for i in range(0, 13, 2)])
+tool = "".join(s for k, s in got if k == "tool")
+ok("unclosed fence yields no tool", tool == "", f"tool={tool!r}")
 
 print("=== parser: single, multiple, array, string-args ===")
 c1 = p4.parse_tool_block('{"name":"terminal","arguments":{"command":"ls"}}')
