@@ -364,17 +364,16 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
     heartbeat the client instead of sitting silent."""
     acp = _ACP
     await acp.ensure_alive()
-    acp._active += 1
-    acp._turns += 1
     last_usage_logged = 0
     # affinity: (key, delta_text, full_count). Fresh session when key unknown,
     # busy, idle, or model-mismatched server state unclear -> fall back safe.
     aff_key = aff_delta = aff_count = aff_check = aff_store = None
     aff_entry = None
-    try:
-        await reap_orphans(acp)
-    except asyncio.CancelledError:
-        raise
+    # Reap BEFORE claiming busy and BEFORE counting active: a cancel here
+    # must leak nothing (no busy entry exists yet, _active untouched).
+    await reap_orphans(acp)
+    acp._active += 1
+    acp._turns += 1
     if affinity:
         aff_key = affinity[0]
         aff_delta = affinity[1] if len(affinity) > 1 else ""

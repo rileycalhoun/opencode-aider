@@ -432,7 +432,7 @@ def parse_tool_block(raw):
             i = s.find("{")
             if i < 0:
                 break
-            if any(c in s[:i] for c in '{}":'):
+            if any(c in s[:i] for c in '{}":[]'):
                 print("[proxy] parse: stopping at structured text: %s"
                       % s[:i][:80], flush=True)
                 break
@@ -455,8 +455,10 @@ def parse_tool_block(raw):
         name = it.get("name") or it.get("tool") or it.get("function")
         args = None
         if isinstance(name, dict):
-            args = name.get("arguments", name.get("parameters",
-                                                  name.get("args", {})))
+            for _k in ("arguments", "parameters", "args"):
+                if _k in name:
+                    args = name[_k]
+                    break
             name = name.get("name")
         if not name or not isinstance(name, str):
             print("[proxy] parse: dropping nameless tool object",
@@ -506,6 +508,16 @@ async def collect(model, prompt, stream_cb=None, log=None,
     so minutes of legitimate model compute looked identical to a hang.
     """
     t0 = time.monotonic()
+    try:
+        _offered_v, _forced_v, _mode_v = enforce
+        assert isinstance(_offered_v, list)
+        assert _mode_v in ("auto", "none", "required")
+    except Exception:
+        if enforce is not None:
+            print("[proxy] enforce contract invalid: auto fallback",
+                  flush=True)
+        _offered_v, _forced_v, _mode_v = [], None, "auto"
+    enforce = (_offered_v, _forced_v, _mode_v)
     first_at = None
     def note_text():
         nonlocal first_at
@@ -622,20 +634,8 @@ async def collect(model, prompt, stream_cb=None, log=None,
                 tool_raw.append(seg)
 
         calls = parse_tool_block("".join(tool_raw))
-        try:
-            _offered_names, _forced_name, _mode = enforce
-            assert isinstance(_offered_names, list)
-            assert _mode in ("auto", "none", "required")
-        except Exception:
-            print("[proxy] enforce contract invalid: auto fallback",
-                  flush=True)
-            _offered_names, _forced_name, _mode = [], None, "auto"
+        _offered_names, _forced_name, _mode = enforce
         _affkey = affinity[0] if affinity else None
-        _req = enforce[1] if enforce else None
-        if enforce:
-            _req = enforce[1] if len(enforce) > 1 else None
-            if enforce[2]:
-                _req = _req or "*any*"
         if enforce and calls:
             if _mode == "none":
                 if log:
@@ -792,9 +792,8 @@ async def handle_direct(request, body, model):
                     await resp.write_eof()
                 except Exception:
                     pass
-            finally:
-                await upstream.release()
-                print("[proxy] direct %s streamed done" % model, flush=True)
+            await upstream.release()
+            print("[proxy] direct %s streamed done" % model, flush=True)
             return resp
         try:
             payload = await upstream.json()
@@ -864,7 +863,9 @@ async def handle_chat(request):
         affinity = (_akey, "", len(_msgs), None, _store)
     elif not _delta.strip() or len(_delta) > MAX_PROMPT_CHARS:
         # Nothing new, or too much new: FRESH session with the full
-        # prompt. Never re-send full text into a live session.
+        # prompt, under a REMAPPED key so the next turn doesn't repeat
+        # this full resend against the old mapping.
+        _drop_affinity(_akey)
         affinity = None
     else:
         _prior = flatten_history(_msgs[:_sent])
@@ -917,7 +918,7 @@ async def handle_chat(request):
         _ka.cancel()
         try:
             await _ka
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             pass
 
     _ka = _aio.ensure_future(_keepalive())
@@ -946,7 +947,6 @@ async def handle_chat(request):
         await send(chunk(cid, model, finish="tool_calls" if calls else "stop"))
         await send("[DONE]")
         await resp.write_eof()
-        await _stop_ka()
         print(f"[proxy] -> done text={len(text)}ch tools={len(calls)} alien={alien}", flush=True)
     except asyncio.TimeoutError:
         await send(chunk(cid, model, delta="[proxy] timeout waiting for opencode"))
@@ -954,7 +954,6 @@ async def handle_chat(request):
         await send("[DONE]")
         await resp.write_eof()
     except Exception as e:
-        await _stop_ka()
         print(f"[proxy] STREAM ERROR: {e}", flush=True)
         try:
             await send(chunk(cid, model, delta=f"[proxy error] {e}"))
@@ -963,6 +962,8 @@ async def handle_chat(request):
             await resp.write_eof()
         except Exception:
             pass
+        finally:
+            await _stop_ka()
     return resp
 
 
