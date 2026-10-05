@@ -247,14 +247,13 @@ class AcpProcess:
         fut = loop.create_future()
         self._pending[mid] = fut
         try:
-            await asyncio.wait_for(
-                self._send_raw({"jsonrpc": "2.0", "id": mid,
-                                "method": method, "params": params}),
-                timeout=30)
-        except Exception:
-            self._pending.pop(mid, None)
-            raise
-        try:
+            try:
+                await asyncio.wait_for(
+                    self._send_raw({"jsonrpc": "2.0", "id": mid,
+                                    "method": method, "params": params}),
+                    timeout=30)
+            except (Exception, asyncio.CancelledError):
+                raise
             return await asyncio.wait_for(fut, timeout)
         finally:
             self._pending.pop(mid, None)
@@ -293,7 +292,7 @@ def peek_sent(key):
     if not e:
         return None
     import time as _t
-    if _t.monotonic() - e["last"] > _AFFINITY_IDLE:
+    if _t.monotonic() - e["last"] > _AFFINITY_IDLE and not e.get("busy"):
         _AFFINITY.pop(key, None)
         _orphan(e["sid"])  # idle-evicted: must be closed
         return None
@@ -308,10 +307,13 @@ def peek_sent(key):
 def mark_sent(key, sid, count, model, pfx=None):
     import time as _t
     prev = _AFFINITY.get(key)
-    if prev is not None and prev.get("sid") != sid:
-        _orphan(prev["sid"])  # displaced mapping: close it
-    while len(_AFFINITY) >= _AFFINITY_MAX and key not in _AFFINITY:
-        oldest = min(_AFFINITY, key=lambda k: _AFFINITY[k]["last"])
+    if prev is not None and prev.get("sid") != sid and not prev.get("busy"):
+        _orphan(prev["sid"])  # displaced idle mapping: close it
+    idle_keys = [k for k in _AFFINITY
+                 if k != key and not _AFFINITY[k].get("busy")]
+    while len(_AFFINITY) >= _AFFINITY_MAX and idle_keys:
+        oldest = min(idle_keys, key=lambda k: _AFFINITY[k]["last"])
+        idle_keys.remove(oldest)
         old = _AFFINITY.pop(oldest, None)
         if old is not None:
             _orphan(old["sid"])
@@ -331,6 +333,8 @@ def drop_affinity(key):
 
 
 async def reap_orphans(acp, limit=2):
+    # NOTE: callers run this before claiming busy entries, so a cancelled
+    # reap can never strand a claimed entry as busyforever.
     live = set(acp._sessions) | {e["sid"] for e in _AFFINITY.values()}
     for dead in [k for k in _AFF_USE if k not in live]:
         _AFF_USE.pop(dead, None)
@@ -339,6 +343,9 @@ async def reap_orphans(acp, limit=2):
         try:
             await acp.request("session/close", {"sessionId": sid},
                               timeout=3)
+        except asyncio.CancelledError:
+            _orphan(sid)  # close never ran: keep it for next time
+            raise
         except Exception:
             pass
         acp.forget_session(sid)
@@ -426,7 +433,7 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                     await acp.request("session/set_config_option",
                                       {"sessionId": sid, "configId": "model",
                                        "value": "opencode/" + model})
-                except Exception:
+                except (Exception, asyncio.CancelledError) as _e:
                     abnormal = True
                     try:
                         await acp.request("session/close",
@@ -558,37 +565,14 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                             tool_active = False  # model spoke: prior tool done
                             yield ("text", content["text"])
                     elif kind in ("tool_call", "tool_call_update"):
-                        title = update.get("title") or ""
-                        call_id = update.get("toolCallId") or ""
-                        if call_id and call_id in bridged_ids:
-                            bridged = True
-                        else:
-                            bridged = (title == MCP_BRIDGE_NAME
-                                       or title.startswith(MCP_BRIDGE_NAME + "_"))
-                            if bridged and call_id:
-                                bridged_ids.add(call_id)
-                            elif not title and not bridged:
-                                _log("untitled tool frame: %s"
-                                     % json.dumps(update)[:200])
-                        if bridged:
-                            # Server-side read (file_read/glob/grep): executed
-                            # synchronously, result already in-frame. Forward
-                            # as progress so the client sees movement.
-                            if progress_cb is not None:
-                                try:
-                                    res = progress_cb("read %s" % title)
-                                    if res is not None:
-                                        await res
-                                except (ConnectionResetError,
-                                        asyncio.CancelledError):
-                                    raise
-                                except Exception:
-                                    pass
-                        else:
-                            raise AcpError(
-                                "alien_tool_frame:%s: server executed a native "
-                                "tool; results never reach the client"
-                                % (title or "unknown"))
+                        # No legitimate tool frames exist (mcpServers is
+                        # always []): any native execution is pure waste
+                        # from the client's view and a live bash/edit
+                        # hazard. Cancel immediately.
+                        title = update.get("title") or "unknown"
+                        raise AcpError(
+                            "alien_tool_frame:%s: server executed a native "
+                            "tool; results never reach the client" % title)
                     elif kind == "usage_update":
                         try:
                             used = int(update.get("used") or 0)

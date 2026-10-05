@@ -30,7 +30,8 @@ Two hard problems this solves, both verified empirically (2026-09-28):
 """
 
 import asyncio, json, os, uuid, argparse, re, time
-from acp_transport import AcpError, TURN_TIMEOUT, acp_turn_events
+from acp_transport import (AcpError, TURN_TIMEOUT, acp_turn_events,
+    drop_affinity as _drop_affinity)
 from aiohttp import web
 
 OPENCODE_CLI = os.environ.get(
@@ -273,6 +274,14 @@ def affinity_key_for(model, body, header_key=None):
     tool_sig = ",".join(
         sorted(str(((t.get("function") or {}).get("name") or ""))
                for t in (body.get("tools") or [])))[:500]
+    import hashlib as _hl4
+    cat_sig = _hl4.sha1(json.dumps(
+        body.get("tools") or [], sort_keys=True,
+        ensure_ascii=False).encode()).hexdigest()[:12]
+    tc_sig = _hl4.sha1(json.dumps(
+        body.get("tool_choice") or "auto", sort_keys=True,
+        ensure_ascii=False).encode()).hexdigest()[:8]
+    tool_sig = tool_sig + "|" + cat_sig + "|" + tc_sig
     return "h:" + _hl.sha1(
         (model + "|" + sys_text + "|" + first_text + "|" + tool_sig).encode()
     ).hexdigest()[:16]
@@ -392,6 +401,17 @@ def parse_tool_block(raw):
         s = "\n".join(lines)
     dec = json.JSONDecoder()
     skipped_prefix = False
+    if s.lstrip().startswith("["):
+        # Array envelope: all or nothing. Never seek inside a broken array
+        # to manufacture calls from its fragments.
+        try:
+            arr = json.loads(s)
+            objs = arr if isinstance(arr, list) else [arr]
+            s = ""
+        except json.JSONDecodeError:
+            print("[proxy] parse: dropping malformed array block",
+                  flush=True)
+            return []
     while s.strip():
         s = s.strip().lstrip(",")
         if not s:
@@ -415,6 +435,7 @@ def parse_tool_block(raw):
             break
         objs.append(obj)
         s = s[end:].lstrip().lstrip(",")
+        skipped_prefix = True
     calls = []
     for it in objs:
         if not isinstance(it, dict):
@@ -538,7 +559,10 @@ async def collect(model, prompt, stream_cb=None, log=None,
             msg = str(e)
             if "alien_tool_frame:" in msg and not (enforce and enforce[0]):
                 # No fenced tools exist in this turn: prose is the only
-                # useful output. Keep what streamed, no error.
+                # useful output. Flush held text, keep what streamed.
+                for kind, seg in sp.flush():
+                    if kind == "text":
+                        text_parts.append(seg)
                 if log:
                     log("alien with tools=0: returning prose")
                 return "".join(text_parts), [], [], attempt + 1
@@ -552,6 +576,7 @@ async def collect(model, prompt, stream_cb=None, log=None,
                           "the final answer; prior attempts are superseded.")
                 corrected = True
                 affinity = None  # fresh session, not a duplicate re-send
+                _drop_affinity(affinity and affinity[0])
                 continue
             if attempt < 2 and TRANSIENT_RE.search(msg):
                 if stream_cb:
@@ -578,38 +603,44 @@ async def collect(model, prompt, stream_cb=None, log=None,
                 tool_raw.append(seg)
 
         calls = parse_tool_block("".join(tool_raw))
+        _mode = enforce[2] if enforce else "auto"
+        _forced_name = enforce[1] if enforce else None
+        _offered_names = enforce[0] if enforce else []
         _req = enforce[1] if enforce else None
         if enforce:
             _req = enforce[1] if len(enforce) > 1 else None
             if enforce[2]:
                 _req = _req or "*any*"
         if enforce and calls:
-            offered, forced, none_flag = enforce
-            if none_flag:
+            if _mode == "none":
                 if log:
                     log("dropping %d calls: tool_choice none" % len(calls))
                 calls = []
             else:
                 kept = [c for c in calls
-                        if c["function"]["name"] in offered
-                        and (forced is None
-                             or c["function"]["name"] == forced)]
+                        if c["function"]["name"] in _offered_names
+                        and (_forced_name is None
+                             or c["function"]["name"] == _forced_name)]
                 if len(kept) != len(calls) and log:
                     log("dropping %d unenforced calls"
                         % (len(calls) - len(kept)))
                 calls = kept
-        if (_req and not calls and not corrected and attempt < 2):
+        if (_mode == "required" and not calls
+                and not corrected and attempt < 2):
             prompt = (prompt + "\n\n[system] You MUST emit the fenced "
                       "<tool_call> block this turn" +
-                      ("" if _req == "*any*" else " for `%s`" % _req) +
+                      ("" if _forced_name is None
+                       else " for `%s`" % _forced_name) +
                       ". Plain prose is not acceptable. Judge only the "
                       "final answer; prior attempts are superseded.")
             corrected = True
             affinity = None
             continue
-        if _req and not calls:
-            raise ShimError("required tool %s produced no call" % _req)
+        if _mode == "required" and not calls:
+            raise ShimError("required tool %s produced no call"
+                            % (_forced_name or "any"))
         if not calls and not alien and attempt < 2 and NARRATE_RE.search("".join(text_parts)):
+            _drop_affinity(affinity and affinity[0])
             # Model talked about the protocol instead of using it. Correct it.
             prompt = (prompt + "\n\n[system] Your last response talked about the tool "
                       "protocol instead of using it. Do not explain or narrate. Either "
@@ -788,7 +819,9 @@ async def handle_chat(request):
     if isinstance(_tc, dict):
         _fn = _tc.get("function") or {}
         _forced = _fn.get("name") or _tc.get("name")
-    _enforce = (_offered, _forced, _tc == "none")
+    _mode = "none" if _tc == "none" else ("required" if (
+        _tc == "required" or _forced) else "auto")
+    _enforce = (_offered, _forced, _mode)
     from acp_transport import peek_sent as _peek
     _akey = affinity_key_for(
         model, body, request.headers.get("X-Shim-Session"))
@@ -797,13 +830,17 @@ async def handle_chat(request):
     _full_flat = flatten_history(_msgs)
     import hashlib as _hl3
     _store = _hl3.sha1(_full_flat.encode()).hexdigest()[:16]
-    if _sent is not None:
+    _new = _msgs[_sent:] if _sent is not None else []
+    while _new and (_new[0].get("role") == "assistant"):
+        _new = _new[1:]
+    _delta = flatten_history(_new)
+    if (_sent is None or not _delta.strip()
+            or len(_delta) > MAX_PROMPT_CHARS):
+        affinity = (_akey, "", len(_msgs), None, _store)
+    else:
         _prior = flatten_history(_msgs[:_sent])
         _check = _hl3.sha1(_prior.encode()).hexdigest()[:16]
-        _delta = flatten_history(_msgs[_sent:])
         affinity = (_akey, _delta, len(_msgs), _check, _store)
-    else:
-        affinity = (_akey, "", len(_msgs), None, _store)
     print(f"[proxy] {requested}->{model} {len(prompt)}ch "
           f"{'stream' if stream else 'block'} tools={ntools}", flush=True)
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
@@ -830,6 +867,20 @@ async def handle_chat(request):
     async def send(payload):
         await resp.write(f"data: {payload}\n\n".encode())
 
+    import asyncio as _aio
+    _stop_keep = False
+
+    async def _keepalive():
+        try:
+            while not _stop_keep:
+                await _aio.sleep(45)
+                if _stop_keep:
+                    break
+                await send(chunk(cid, model, delta={}))
+        except Exception:
+            pass
+
+    _ka = _aio.ensure_future(_keepalive())
     try:
         await send(chunk(cid, model, delta={"role": "assistant", "content": ""}))
 
@@ -855,6 +906,7 @@ async def handle_chat(request):
         await send(chunk(cid, model, finish="tool_calls" if calls else "stop"))
         await send("[DONE]")
         await resp.write_eof()
+        _stop_keep = True
         print(f"[proxy] -> done text={len(text)}ch tools={len(calls)} alien={alien}", flush=True)
     except asyncio.TimeoutError:
         await send(chunk(cid, model, delta="[proxy] timeout waiting for opencode"))
@@ -862,6 +914,7 @@ async def handle_chat(request):
         await send("[DONE]")
         await resp.write_eof()
     except Exception as e:
+        _stop_keep = True
         print(f"[proxy] STREAM ERROR: {e}", flush=True)
         try:
             await send(chunk(cid, model, delta=f"[proxy error] {e}"))
