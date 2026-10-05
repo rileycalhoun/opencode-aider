@@ -246,6 +246,13 @@ def tool_choice_directive(body):
     if tc == "required":
         return True, ("[system] You MUST call a tool this turn: respond "
                       "with ONLY the tool-call block, no prose."), None
+    if isinstance(tc, dict) and tc.get("type") == "function" and tc.get(
+            "name") and not (tc.get("function") or {}).get("name"):
+        # {"type": "function", "name": X}: same force, top-level spelling.
+        return True, ("[system] The caller requires a call to `%s` this "
+                      "turn. Respond with ONLY the tool-call block for that "
+                      "tool, no prose before or after it." % tc.get("name")
+                      ), tc.get("name")
     name = None
     if isinstance(tc, dict):
         if tc.get("type") == "function":
@@ -514,8 +521,9 @@ async def collect(model, prompt, stream_cb=None, log=None,
         # Direct caller passes None: no catalogue to enforce against.
         try:
             _offered_v, _forced_v, _mode_v = enforce
-            assert isinstance(_offered_v, list)
-            assert _mode_v in ("auto", "none", "required")
+            if (not isinstance(_offered_v, list)
+                    or _mode_v not in ("auto", "none", "required")):
+                raise ValueError("bad enforce shape")
         except Exception as _e:
             print("[proxy] enforce contract invalid (%s): skipped"
                   % _e, flush=True)
@@ -587,7 +595,7 @@ async def collect(model, prompt, stream_cb=None, log=None,
                 pass
             _drop_if_idle(affinity[0] if affinity else None)
             affinity = None
-            if time.monotonic() < deadline - 1 and attempt < 2:
+            if time.monotonic() < deadline - 30 and attempt < 2:
                 if log:
                     log("attempt timeout: fresh retry with budget left")
                 if stream_cb:
@@ -648,7 +656,6 @@ async def collect(model, prompt, stream_cb=None, log=None,
                 tool_raw.append(seg)
 
         calls = parse_tool_block("".join(tool_raw))
-        _affkey = affinity[0] if affinity else None
         if _offered_v is not None and calls:
             if _mode_v == "none":
                 if log:
@@ -811,6 +818,9 @@ async def handle_direct(request, body, model):
             await upstream.release()
             if ok and upstream.status < 400:
                 print("[proxy] direct %s streamed done" % model, flush=True)
+            elif not ok or upstream.status >= 400:
+                print("[proxy] direct %s relayed status=%s"
+                      % (model, upstream.status), flush=True)
             return resp
         try:
             payload = await upstream.json()
@@ -879,9 +889,9 @@ async def handle_chat(request):
     if _sent is None:
         affinity = (_akey, "", len(_msgs), None, _store)
     elif not _delta.strip() or len(_delta) > MAX_PROMPT_CHARS:
-        # Nothing new, or too much new: FRESH session with the full
-        # prompt, under a REMAPPED key so the next turn doesn't repeat
-        # this full resend against the old mapping.
+        # Nothing new, or too much new: drop the old mapping, then
+        # map a FRESH session under the SAME key with the full prompt,
+        # so the next turn resumes deltas.
         # Drop the old mapping and start a FRESH mapped session
         # with the full prompt, so the NEXT turn resumes deltas
         # instead of full-resending forever.

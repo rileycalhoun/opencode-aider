@@ -516,6 +516,9 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                             # raise (fatal); disconnect propagates.
                             if not isinstance(frame, dict):
                                 return None
+                            if frame.get("__acp_dead__"):
+                                raise AcpError(
+                                    "acp process died mid-turn (aborted)")
                             ek = frame.get("sessionUpdate")
                             if ek == "agent_message_chunk":
                                 ec = frame.get("content") or {}
@@ -624,6 +627,9 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                     try:
                         await acp.request("session/close", {"sessionId": sid},
                                           timeout=10)
+                    except asyncio.CancelledError:
+                        _orphan(sid)
+                        raise
                     except Exception:
                         pass
                 elif aff_key is not None and mark_sent(
@@ -637,6 +643,9 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                     try:
                         await acp.request("session/close", {"sessionId": sid},
                                           timeout=10)
+                    except asyncio.CancelledError:
+                        _orphan(sid)
+                        raise
                     except Exception:
                         pass
         finally:
