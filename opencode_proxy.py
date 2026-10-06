@@ -268,6 +268,18 @@ def tool_choice_directive(body):
         "after it." % name), name
 
 
+def stable_key_for(model, body):
+    import hashlib as _hl5
+    msgs = body.get("messages", []) if isinstance(body, dict) else []
+    sys_text = " ".join(
+        _content_to_text(m.get("content")) for m in msgs
+        if m.get("role") == "system")[:2000]
+    first_user = next((m for m in msgs if m.get("role") == "user"), {})
+    first_text = _content_to_text(first_user.get("content"))[:2000]
+    return "s:" + _hl5.sha1(
+        (model + "|" + sys_text + "|" + first_text).encode()).hexdigest()[:16]
+
+
 def affinity_key_for(model, body, header_key=None):
     """Stable conversation key: explicit header wins, else hash of
     model + system + first user message. Collisions across DISTINCT live
@@ -507,14 +519,40 @@ class ShimError(Exception):
 
 
 REQUEST_BUDGET = 1500  # hard ceiling per client request, all attempts
-_ALIEN_STRIKES = {}  # affinity key -> consecutive alien-grab turns
+_ALIEN_STRIKES = {}  # stable conversation key -> [count, last_seen]
 _ALIEN_STRIKE_MAX = 128  # bound the ledger
+_ALIEN_STRIKE_TTL = 1800  # entries older than this are dead conversations
 _ALIEN_HARD_AT = 3  # third consecutive grab fails loud instead of guiding
+
+
+def _strike_get(key):
+    now = time.monotonic()
+    ent = _ALIEN_STRIKES.get(key)
+    if ent is None:
+        return 0
+    if now - ent[1] > _ALIEN_STRIKE_TTL:
+        _ALIEN_STRIKES.pop(key, None)
+        return 0
+    return ent[0]
+
+
+def _strike_add(key):
+    now = time.monotonic()
+    for k in [k for k, v in _ALIEN_STRIKES.items()
+              if now - v[1] > _ALIEN_STRIKE_TTL]:
+        _ALIEN_STRIKES.pop(k, None)
+    if key not in _ALIEN_STRIKES and len(_ALIEN_STRIKES) >= _ALIEN_STRIKE_MAX:
+        _ALIEN_STRIKES.pop(next(iter(_ALIEN_STRIKES)), None)
+    ent = _ALIEN_STRIKES.get(key, [0, now])
+    ent[0] += 1
+    ent[1] = now
+    _ALIEN_STRIKES[key] = ent
+    return ent[0]
 
 
 async def collect(model, prompt, stream_cb=None, log=None,
                   progress_cb=None, affinity=None, enforce=None,
-                  turn_timeout=None):
+                  turn_timeout=None, strike_key=None):
     """Run one turn. Returns (text, tool_calls, alien_tool_names).
 
     Logs time-to-first-text so a slow-prefill turn is distinguishable from a
@@ -627,37 +665,41 @@ async def collect(model, prompt, stream_cb=None, log=None,
                 return "".join(text_parts), [], [], attempt + 1
             if "alien_tool_frame:" in msg:
                 aname = msg.split(":", 2)[1] if msg.count(":") >= 2 else "?"
-                akey = affinity[0] if affinity else None
-                strikes = _ALIEN_STRIKES.get(akey, 0) + 1 if akey else 1
-                if akey:
-                    if len(_ALIEN_STRIKES) >= _ALIEN_STRIKE_MAX:
-                        _ALIEN_STRIKES.pop(next(iter(_ALIEN_STRIKES)), None)
-                    _ALIEN_STRIKES[akey] = strikes
-                _drop_if_idle(akey)
+                akey = strike_key
+                strikes = _strike_add(akey) if akey else 1
+                _drop_if_idle(affinity[0] if affinity else None)
                 affinity = None
                 if strikes >= _ALIEN_HARD_AT:
                     raise AcpError(
                         "alien_tool_frame:%s: repeated native-tool grabs "
                         "(%d consecutive); refusing to loop" % (aname, strikes))
                 offered = _offered_v or []
-                sug = next((n for n in offered if "read" in n.lower()),
-                           None) if aname.lower() in (
-                               "read", "glob", "grep", "fetch") else None
-                if sug is None:
+                sug = None
+                if _forced_v:
+                    sug = _forced_v  # forced tool is the answer by definition
+                elif aname.lower() in ("read", "glob", "grep", "fetch"):
+                    sug = next((n for n in offered if "read" in n.lower()),
+                               None)
+                elif aname.lower() in ("bash", "shell", "sh", "exec", "run"):
                     sug = next((n for n in offered
                                 if any(k in n.lower() for k in
                                        ("exec", "bash", "shell", "run",
                                         "command"))), None)
-                if sug is None and offered:
-                    sug = offered[0]
+                for kind, seg in sp.flush():
+                    if kind == "text":
+                        text_parts.append(seg)
+                        note_text()
+                        if stream_cb:
+                            await stream_cb(seg)
                 guide = ("\n[shim: blocked native `%s` -- not permitted "
-                         "here; server-side execution was stopped before "
-                         "it could run. " % aname)
+                         "here; this turn was stopped. " % aname)
                 if sug:
                     guide += ("To do this, emit ONLY the fenced <tool_call> "
                               "block using the `%s` client tool.]\n" % sug)
                 else:
-                    guide += ("Answer in plain prose instead.]\n")
+                    guide += ("Choose an appropriate listed client tool "
+                              "with a fenced <tool_call> block, or answer "
+                              "in plain prose.]\n")
                 text_parts.append(guide)
                 note_text()
                 if stream_cb:
@@ -666,18 +708,6 @@ async def collect(model, prompt, stream_cb=None, log=None,
                     log("alien guided (%d): %s -> %s"
                         % (strikes, aname, sug or "prose"))
                 return "".join(text_parts), [], [], attempt + 1
-            if (False and "alien_tool_frame:" in msg and not corrected
-                    and attempt < 2):
-                aname = msg.split(":", 2)[1] if msg.count(":") >= 2 else "?"
-                prompt = (prompt + "\n\n[system] Your last attempt reached "
-                          "for a built-in tool (" + aname + ") that does not "
-                          "exist here. Use the fenced <tool_call> block with "
-                          "a listed tool, or answer in plain text. Judge only "
-                          "the final answer; prior attempts are superseded.")
-                corrected = True
-                _drop_if_idle(affinity[0] if affinity else None)
-                affinity = None  # fresh session, not a duplicate re-send
-                continue
             if attempt < 2 and TRANSIENT_RE.search(msg):
                 if time.monotonic() >= deadline - 30:
                     raise
@@ -747,9 +777,8 @@ async def collect(model, prompt, stream_cb=None, log=None,
             affinity = None  # retry starts a fresh session, not a re-send
             continue
         if calls or not alien or attempt == 2:
-            _rk = affinity[0] if affinity else None
-            if _rk and _rk in _ALIEN_STRIKES:
-                _ALIEN_STRIKES.pop(_rk, None)  # clean turn resets strikes
+            if strike_key and strike_key in _ALIEN_STRIKES:
+                _ALIEN_STRIKES.pop(strike_key, None)  # clean turn resets
             return "".join(text_parts), calls, alien, attempt + 1
         if corrected:
             # Already spent the one correction on narration; hand the alien
@@ -954,13 +983,15 @@ async def handle_chat(request):
     print(f"[proxy] {requested}->{model} {len(prompt)}ch "
           f"{'stream' if stream else 'block'} tools={ntools}", flush=True)
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+    _skey = stable_key_for(model, body)
 
     if not stream:
         try:
             text, calls, alien, attempts = await collect(
                 model, prompt,
                 log=lambda m: print(f"[proxy] {cid} {m}", flush=True),
-                affinity=affinity, enforce=_enforce)
+                affinity=affinity, enforce=_enforce,
+                strike_key=_skey)
             return web.json_response(final_body(cid, model, text, calls,
                                                shim={"prompt_chars": len(prompt),
                                                      "alien": alien,
@@ -1017,7 +1048,8 @@ async def handle_chat(request):
         text, calls, alien, attempts = await collect(
             model, prompt, stream_cb=on_text, progress_cb=on_progress,
             log=lambda m: print(f"[proxy] {cid} {m}", flush=True),
-            affinity=affinity, enforce=_enforce)
+            affinity=affinity, enforce=_enforce,
+            strike_key=_skey)
         for payload in tool_call_chunks(cid, model, calls):
             await send(payload)
         if _want_progress:
