@@ -676,7 +676,7 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                         _orphan(sid)
                         raise
                     except Exception:
-                        pass
+                        _orphan(sid)  # close failed: let the reaper retry
                 elif aff_key is not None and mark_sent(
                         aff_key, sid, aff_count, model, aff_store):
                     # Healthy turn, mapping kept: session lives on.
