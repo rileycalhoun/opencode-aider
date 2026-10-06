@@ -100,10 +100,10 @@ CLOSE_FENCE = "</tool_call>"
 PROTOCOL = """\
 # TOOL PROTOCOL (read carefully)
 
-You do NOT have any built-in tools. Anything you think you can do with a
-built-in shell, file reader or editor does not exist here, and its output is
-discarded. You have exactly the tools listed below, provided by an external
-harness that executes them for you and returns the results.
+Native read/glob/grep are permitted for server-side project reads; their
+results stay server-side for you to consume. All other native tools are
+forbidden. Client work must use fenced blocks with the tools listed below;
+the external harness executes those tools and returns the results.
 
 To call one or more tools, output ONLY this fenced block, with no other text:
 
@@ -118,7 +118,7 @@ Rules:
   block. They are executed in parallel.
 - Use EXACT tool names as written below.
 - When you already have everything you need, reply with plain prose and NO block.
-- You have NO built-in tools: no shell, no file readers, no task runners. Anything you cannot do with a listed tool, say so in prose instead of reaching for one.
+- Only native read/glob/grep are permitted (exact names, case-insensitive). All other native tools are forbidden, including bash, edit, write, task, todowrite, webfetch, skill, and unknown names. Client work must use fenced blocks with listed tools.
 
 Completed example (real call — copy this shape exactly, with a real tool name):
 
@@ -128,7 +128,7 @@ Completed example (real call — copy this shape exactly, with a real tool name)
 """
 
 PROTOCOL_SPARK = PROTOCOL + """\
-Names like todowrite, task, bash, read, skill, websearch are NOT yours. They do not exist here. Emitting one fails the turn outright — use the fenced block above with a listed tool instead."""
+Native read/glob/grep are permitted. All other native tools are forbidden, including todowrite, task, bash, skill, and websearch. Client work must use the fenced block above with a listed tool."""
 
 
 def resolve_model(name):
@@ -314,8 +314,10 @@ def build_prompt(body):
                  if ((t.get("function") or {}).get("name") == forced)] or tools
     parts = []
     if (not tools) or (body.get("tool_choice") == "none"):
-        parts.append("You have no tools in this turn. Answer in plain "
-                     "prose; never reach for built-in tools.")
+        parts.append("Native read/glob/grep are permitted for server-side "
+                     "project reads. All other native tools are forbidden. "
+                     "No client tools are available in this turn; client "
+                     "work requires fenced blocks with listed tools. Answer in plain prose.")
     if tools and render_catalogue:
         model_name = (body.get("model") or "").lower()
         proto = PROTOCOL_SPARK if "muse-spark" in model_name else PROTOCOL

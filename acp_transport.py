@@ -10,10 +10,10 @@ untouched downstream): yields ('text', delta) | ('alien_tool', name).
 Mapping notes, all observed live against opencode 1.18.33:
 - agent_message_chunk content {type: text, text} -> ("text", delta).
   Deltas arrive already sliced; no cumulative diffing needed.
-- tool_call / tool_call_update frames are ALWAYS alien here: we declare no
-  MCP servers, and fenced client tools travel as text, so any ACP-native
-  tool call is necessarily an opencode built-in. Title only; results stay
-  suppressed exactly like the CLI path.
+- Native read/glob/grep frames are allowed; results stay server-side for
+  the model to consume. All other tool titles are fatal. We declare no
+  MCP servers, and fenced client tools travel as text. Native tool frames
+  are never forwarded to the client.
 - Inbound requests from the agent (none observed across all probes) get a
   logged MethodNotFound denial: fail-visible beats hang-forever.
 - HOME isolation: the ACP process runs under an isolated HOME holding only
@@ -48,6 +48,7 @@ ACP_AUTH_SRC = "/home/opencode/.local/share/opencode/auth.json"
 IDLE_TIMEOUT = 300  # base: abort a turn silent this long (matches retry classifier)
 IDLE_TIMEOUT_FIRST = 600  # pre-first-frame: giant prompts are slow to start
 IDLE_TIMEOUT_TOOL = 900  # tool inflight: ACP sends nothing during execution
+NATIVE_READ_TITLES = frozenset(("read", "glob", "grep"))
 TURN_TIMEOUT = 1200  # hard ceiling per turn (20 min)
 MAX_TURNS_PER_PROC = 25  # recycle the shared proc past this many turns
 STDERR_RING = 200  # agent stderr lines kept for failure dumps
@@ -471,7 +472,7 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
             shared = False
             sid = None
         if not shared:
-            # No MCP servers, ever: only fenced client tools exist here.
+            # No MCP servers: client work uses fences; native reads may run.
             # (MCP_BRIDGE_* kept for debugging; do not re-enable without
             # need. Server-side tools bypass client approvals.)
             resp = await acp.request("session/new",
@@ -555,8 +556,8 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                             raise AcpError("turn ended %s without content"
                                            % stop)
                         # Linger-drain: harvest frames already in flight
-                        # (final text), with a hard total cap. Tool frames
-                        # stay fatal; disconnect propagates (abnormal kept).
+                        # (final text), with a hard total cap. Non-read tool
+                        # frames stay fatal; disconnect propagates.
                         drain_end = asyncio.get_event_loop().time() + 3.0
 
                         async def _drain_text(frame):
@@ -577,6 +578,11 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                             if ek not in ("tool_call", "tool_call_update"):
                                 return None
                             title = frame.get("title") or "unknown"
+                            if (isinstance(title, str)
+                                    and title.lower() in NATIVE_READ_TITLES):
+                                _log("native read allowed: %s title=%s (drain)"
+                                     % (ek, title))
+                                return None
                             raise AcpError(
                                 "alien_tool_frame:%s: server executed "
                                 "a native tool; results never reach "
@@ -642,11 +648,19 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                             tool_active = False  # model spoke: prior tool done
                             yield ("text", content["text"])
                     elif kind in ("tool_call", "tool_call_update"):
-                        # No legitimate tool frames exist (mcpServers is
-                        # always []): any native execution is pure waste
-                        # from the client's view and a live bash/edit
-                        # hazard. Cancel immediately.
+                        # Exact, case-insensitive titles only: no prefix or
+                        # whitespace normalization. Results stay server-side.
                         title = update.get("title") or "unknown"
+                        if (isinstance(title, str)
+                                and title.lower() in NATIVE_READ_TITLES):
+                            tool_active = True
+                            _log("native read allowed: %s title=%s idle=%ds"
+                                 % (kind, title, IDLE_TIMEOUT_TOOL))
+                            if progress_cb is not None:
+                                res = progress_cb("executing native %s" % title)
+                                if res is not None:
+                                    await res
+                            continue
                         raise AcpError(
                             "alien_tool_frame:%s: server executed a native "
                             "tool; results never reach the client" % title)
