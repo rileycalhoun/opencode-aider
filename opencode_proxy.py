@@ -507,6 +507,9 @@ class ShimError(Exception):
 
 
 REQUEST_BUDGET = 1500  # hard ceiling per client request, all attempts
+_ALIEN_STRIKES = {}  # affinity key -> consecutive alien-grab turns
+_ALIEN_STRIKE_MAX = 128  # bound the ledger
+_ALIEN_HARD_AT = 3  # third consecutive grab fails loud instead of guiding
 
 
 async def collect(model, prompt, stream_cb=None, log=None,
@@ -622,7 +625,48 @@ async def collect(model, prompt, stream_cb=None, log=None,
                 if log:
                     log("alien with tools=0: returning prose")
                 return "".join(text_parts), [], [], attempt + 1
-            if ("alien_tool_frame:" in msg and not corrected
+            if "alien_tool_frame:" in msg:
+                aname = msg.split(":", 2)[1] if msg.count(":") >= 2 else "?"
+                akey = affinity[0] if affinity else None
+                strikes = _ALIEN_STRIKES.get(akey, 0) + 1 if akey else 1
+                if akey:
+                    if len(_ALIEN_STRIKES) >= _ALIEN_STRIKE_MAX:
+                        _ALIEN_STRIKES.pop(next(iter(_ALIEN_STRIKES)), None)
+                    _ALIEN_STRIKES[akey] = strikes
+                _drop_if_idle(akey)
+                affinity = None
+                if strikes >= _ALIEN_HARD_AT:
+                    raise AcpError(
+                        "alien_tool_frame:%s: repeated native-tool grabs "
+                        "(%d consecutive); refusing to loop" % (aname, strikes))
+                offered = _offered_v or []
+                sug = next((n for n in offered if "read" in n.lower()),
+                           None) if aname.lower() in (
+                               "read", "glob", "grep", "fetch") else None
+                if sug is None:
+                    sug = next((n for n in offered
+                                if any(k in n.lower() for k in
+                                       ("exec", "bash", "shell", "run",
+                                        "command"))), None)
+                if sug is None and offered:
+                    sug = offered[0]
+                guide = ("\n[shim: blocked native `%s` -- not permitted "
+                         "here; server-side execution was stopped before "
+                         "it could run. " % aname)
+                if sug:
+                    guide += ("To do this, emit ONLY the fenced <tool_call> "
+                              "block using the `%s` client tool.]\n" % sug)
+                else:
+                    guide += ("Answer in plain prose instead.]\n")
+                text_parts.append(guide)
+                note_text()
+                if stream_cb:
+                    await stream_cb(guide)
+                if log:
+                    log("alien guided (%d): %s -> %s"
+                        % (strikes, aname, sug or "prose"))
+                return "".join(text_parts), [], [], attempt + 1
+            if (False and "alien_tool_frame:" in msg and not corrected
                     and attempt < 2):
                 aname = msg.split(":", 2)[1] if msg.count(":") >= 2 else "?"
                 prompt = (prompt + "\n\n[system] Your last attempt reached "
@@ -703,6 +747,9 @@ async def collect(model, prompt, stream_cb=None, log=None,
             affinity = None  # retry starts a fresh session, not a re-send
             continue
         if calls or not alien or attempt == 2:
+            _rk = affinity[0] if affinity else None
+            if _rk and _rk in _ALIEN_STRIKES:
+                _ALIEN_STRIKES.pop(_rk, None)  # clean turn resets strikes
             return "".join(text_parts), calls, alien, attempt + 1
         if corrected:
             # Already spent the one correction on narration; hand the alien
