@@ -642,8 +642,12 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                     # Process died after a complete answer: nothing to
                     # cancel or close server-side (close would respawn
                     # the process just to address a dead sid). Pop the
-                    # mapping without orphaning; forget the queue.
-                    _AFFINITY.pop(aff_key, None) if shared else None
+                    # mapping without orphaning -- but only if it is
+                    # still ours (a concurrent turn may have remapped).
+                    if shared:
+                        if (_AFFINITY.get(aff_key) or {}).get(
+                                "sid") == sid:
+                            _AFFINITY.pop(aff_key, None)
                     acp.forget_session(sid)
                 elif abnormal:
                     # Abnormal exit: tell the server to STOP WORK.
@@ -656,7 +660,7 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                         raise
                     except Exception:
                         pass
-                if abnormal:
+                if abnormal and not died:
                     # Failed turn: poison would linger server-side. Close and
                     # forget so the next turn starts clean -- but only if the
                     # mapping is still ours (a concurrent fallback may have
