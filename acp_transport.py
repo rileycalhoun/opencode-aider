@@ -95,6 +95,7 @@ class AcpProcess:
         self._spawn_lock = None
         self._pending = {}
         self._sessions = {}
+        self._gen = 0  # bumped on every spawn; tags sids/orphans/turns
         self._id_seq = 0
         self._turns = 0
         self._active = 0
@@ -131,6 +132,7 @@ class AcpProcess:
             )
             self._pending = {}
             self._sessions = {}
+            self._gen += 1
             clear_affinity()  # sids die with the proc
             self._turns = 0
             self._stderr_ring.clear()
@@ -239,7 +241,12 @@ class AcpProcess:
             self.proc.stdin.write((json.dumps(obj) + "\n").encode())
             await self.proc.stdin.drain()
 
-    async def request(self, method, params, timeout=60):
+    async def request(self, method, params, timeout=60, expect_gen=None):
+        if expect_gen is not None and (
+                expect_gen != self._gen or self.proc is None
+                or self.proc.returncode is not None):
+            raise AcpError("stale generation %s (current %s): RPC %s skipped"
+                           % (expect_gen, self._gen, method))
         await self.ensure_alive()
         self._id_seq += 1
         mid = self._id_seq
@@ -301,13 +308,13 @@ def peek_sent(key):
     return e["sent"]
 
 
-def mark_sent(key, sid, count, model, pfx=None):
+def mark_sent(key, sid, count, model, pfx=None, gen=None):
     import time as _t
     prev = _AFFINITY.get(key)
     if prev is not None and prev.get("sid") != sid:
         if prev.get("busy"):
             return False  # live turn owns this key: stay one-shot
-        _orphan(prev["sid"])  # displaced idle mapping: close it
+        _orphan(prev["sid"], prev.get("gen"))  # displaced idle mapping
     idle_keys = [k for k in _AFFINITY
                  if k != key and not _AFFINITY[k].get("busy")]
     while (len(_AFFINITY) >= _AFFINITY_MAX and key not in _AFFINITY
@@ -318,13 +325,13 @@ def mark_sent(key, sid, count, model, pfx=None):
         if old is not None:
             _orphan(old["sid"])
     _AFFINITY[key] = {"sid": sid, "sent": count, "last": _t.monotonic(),
-                      "busy": False, "model": model, "pfx": pfx}
+                      "busy": False, "model": model, "pfx": pfx, "gen": gen}
     return True
 
 
-def _orphan(sid):
-    if sid and sid not in _AFF_ORPHANS:
-        _AFF_ORPHANS.append(sid)
+def _orphan(sid, gen=None):
+    if sid and (gen, sid) not in _AFF_ORPHANS:
+        _AFF_ORPHANS.append((gen, sid))
 
 
 def drop_affinity(key):
@@ -352,12 +359,16 @@ async def reap_orphans(acp, limit=2):
     for dead in [k for k in _AFF_USE if k not in live]:
         _AFF_USE.pop(dead, None)
     for _ in range(min(limit, len(_AFF_ORPHANS))):
-        sid = _AFF_ORPHANS.pop(0)
+        item = _AFF_ORPHANS.pop(0)
+        gen, sid = (item if isinstance(item, tuple)
+                      else (None, item))
+        if gen is not None and gen != acp._gen:
+            continue  # died with an older proc; nothing to close
         try:
             await acp.request("session/close", {"sessionId": sid},
                               timeout=3)
         except asyncio.CancelledError:
-            _orphan(sid)  # close never ran: keep it for next time
+            _orphan(sid, acp._gen)  # close never ran: keep it for next time
             raise
         except Exception:
             pass
@@ -382,12 +393,12 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
     heartbeat the client instead of sitting silent."""
     acp = _ACP
     await acp.ensure_alive()
-    turn_proc = acp.proc
-    def _live():
-        # True only while OUR process still serves: after a crash and
-        # respawn, sids died with the old proc and RPCs would only
-        # address strangers (and respawn the process just to do it).
-        return turn_proc is not None and acp.proc is turn_proc
+    # turn_gen binds ALL teardown RPCs + orphans to the exact process
+    # generation that owns this turn's sid. Bound below: fresh sessions
+    # take acp._gen right after session/new; shared turns take the
+    # mapping's stored gen. A mismatch means the sid died with an older
+    # proc: RPCs are skipped (no respawn), orphans are not recorded.
+    turn_gen = None
     last_usage_logged = 0
     # affinity: (key, delta_text, full_count). Fresh session when key unknown,
     # busy, idle, or model-mismatched server state unclear -> fall back safe.
@@ -408,7 +419,8 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
         if aff_entry is not None:
             import time as _t
             stale = (
-                _t.monotonic() - aff_entry["last"] > _AFFINITY_IDLE
+                aff_entry.get("gen") != acp._gen
+                or _t.monotonic() - aff_entry["last"] > _AFFINITY_IDLE
                 or aff_entry["sid"] not in acp._sessions
                 or (aff_check is not None
                     and aff_entry.get("pfx") is not None
@@ -419,11 +431,12 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                 # Fall through to a fresh turn; leave mapping alone.
                 aff_entry = None
             elif stale:
-                _orphan(aff_entry["sid"])
+                _orphan(aff_entry["sid"], aff_entry.get("gen"))
                 drop_affinity(aff_key)
                 aff_entry = None
         if aff_entry is not None:
             aff_entry["busy"] = True
+            turn_gen = aff_entry.get("gen")
     turn_start = asyncio.get_event_loop().time()
     frames_seen = 0
     last_frame_kind = "none"
@@ -454,6 +467,7 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
             if not sid:
                 raise AcpError("session/new gave no sessionId: %s"
                                % json.dumps(resp)[:200])
+            turn_gen = acp._gen
         else:
             _log("affinity hit %s: delta %dch (saved full resend)"
                  % (aff_key, len(aff_delta or "")))
@@ -471,9 +485,10 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                     abnormal = True
                     try:
                         await acp.request("session/close",
-                                          {"sessionId": sid}, timeout=10)
+                                          {"sessionId": sid}, timeout=10,
+                                          expect_gen=turn_gen)
                     except asyncio.CancelledError:
-                        _orphan(sid)
+                        _orphan(sid, turn_gen)
                         raise
                     except Exception:
                         pass
@@ -670,45 +685,43 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                         # cancel+close below own this sid; orphaning it
                         # would let a concurrent reap close it mid-turn.
                         _AFFINITY.pop(aff_key, None)
-                    if not _live():
-                        pass  # serving proc gone with the session: no RPCs
-                    else:
-                        try:
-                            await acp.request("session/cancel",
-                                              {"sessionId": sid}, timeout=10)
-                        except asyncio.CancelledError:
-                            _orphan(sid)
-                            raise
-                        except Exception:
-                            pass
-                    if _live():
-                        try:
-                            await acp.request("session/close",
-                                              {"sessionId": sid}, timeout=10)
-                        except asyncio.CancelledError:
-                            _orphan(sid)
-                            raise
-                        except Exception:
-                            _orphan(sid)  # close failed: reaper retries
+                    try:
+                        await acp.request("session/cancel",
+                                          {"sessionId": sid}, timeout=10,
+                                          expect_gen=turn_gen)
+                    except asyncio.CancelledError:
+                        _orphan(sid, turn_gen)
+                        raise
+                    except Exception:
+                        # Includes stale-generation skip: nothing to cancel.
+                        pass
+                    try:
+                        await acp.request("session/close",
+                                          {"sessionId": sid}, timeout=10,
+                                          expect_gen=turn_gen)
+                    except asyncio.CancelledError:
+                        _orphan(sid, turn_gen)
+                        raise
+                    except Exception:
+                        _orphan(sid, turn_gen)  # close failed: reaper retries
                 elif aff_key is not None and mark_sent(
-                        aff_key, sid, aff_count, model, aff_store):
+                        aff_key, sid, aff_count, model, aff_store,
+                        gen=turn_gen):
                     # Healthy turn, mapping kept: session lives on.
                     kept = True
                 else:
                     # No key, or the key is owned by a live twin turn:
                     # one-shot close, no mapping.
                     kept = False
-                    if not _live():
-                        pass  # serving proc gone with the session
-                    else:
-                        try:
-                            await acp.request("session/close",
-                                              {"sessionId": sid}, timeout=10)
-                        except asyncio.CancelledError:
-                            _orphan(sid)
-                            raise
-                        except Exception:
-                            pass
+                    try:
+                        await acp.request("session/close",
+                                          {"sessionId": sid}, timeout=10,
+                                          expect_gen=turn_gen)
+                    except asyncio.CancelledError:
+                        _orphan(sid, turn_gen)
+                        raise
+                    except Exception:
+                        pass
         finally:
             if aff_entry is not None:
                 aff_entry["busy"] = False
