@@ -248,6 +248,13 @@ class AcpProcess:
             raise AcpError("stale generation %s (current %s): RPC %s skipped"
                            % (expect_gen, self._gen, method))
         await self.ensure_alive()
+        if expect_gen is not None and (
+                expect_gen != self._gen or self.proc is None
+                or self.proc.returncode is not None):
+            # ensure_alive respawned (crash) between check and send:
+            # never address the stranger.
+            raise AcpError("generation moved during %s: RPC skipped"
+                           % method)
         self._id_seq += 1
         mid = self._id_seq
         loop = asyncio.get_event_loop()
@@ -337,7 +344,7 @@ def _orphan(sid, gen=None):
 def drop_affinity(key):
     e = _AFFINITY.pop(key, None)
     if e is not None:
-        _orphan(e["sid"])
+        _orphan(e["sid"], e.get("gen"))
 
 
 def drop_if_idle(key):
@@ -361,14 +368,14 @@ async def reap_orphans(acp, limit=2):
     for _ in range(min(limit, len(_AFF_ORPHANS))):
         item = _AFF_ORPHANS.pop(0)
         gen, sid = (item if isinstance(item, tuple)
-                      else (None, item))
+                    else (None, item))
         if gen is not None and gen != acp._gen:
             continue  # died with an older proc; nothing to close
         try:
             await acp.request("session/close", {"sessionId": sid},
-                              timeout=3)
+                              timeout=3, expect_gen=gen)
         except asyncio.CancelledError:
-            _orphan(sid, acp._gen)  # close never ran: keep it for next time
+            _orphan(sid, gen)  # keep ORIGINAL generation, not current
             raise
         except Exception:
             pass
