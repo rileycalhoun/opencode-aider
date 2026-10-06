@@ -10,8 +10,7 @@ untouched downstream): yields ('text', delta) | ('alien_tool', name).
 Mapping notes, all observed live against opencode 1.18.33:
 - agent_message_chunk content {type: text, text} -> ("text", delta).
   Deltas arrive already sliced; no cumulative diffing needed.
-- Native read/glob/grep frames are allowed; results stay server-side for
-  the model to consume. All other tool titles are fatal. We declare no
+- All native tool frames are fatal, regardless of title. We declare no
   MCP servers, and fenced client tools travel as text. Native tool frames
   are never forwarded to the client.
 - Inbound requests from the agent (none observed across all probes) get a
@@ -48,7 +47,6 @@ ACP_AUTH_SRC = "/home/opencode/.local/share/opencode/auth.json"
 IDLE_TIMEOUT = 300  # base: abort a turn silent this long (matches retry classifier)
 IDLE_TIMEOUT_FIRST = 600  # pre-first-frame: giant prompts are slow to start
 IDLE_TIMEOUT_TOOL = 900  # tool inflight: ACP sends nothing during execution
-NATIVE_READ_TITLES = frozenset(("read", "glob", "grep"))
 TURN_TIMEOUT = 1200  # hard ceiling per turn (20 min)
 MAX_TURNS_PER_PROC = 25  # recycle the shared proc past this many turns
 STDERR_RING = 200  # agent stderr lines kept for failure dumps
@@ -230,84 +228,7 @@ class AcpProcess:
                      "(total %d)" % self._drop_session)
             return
         if "id" in obj and obj.get("method"):
-            if obj.get("method") == "session/request_permission":
-                await self._answer_permission(obj)
-                return
             _log("denying unexpected inbound %s" % obj.get("method"))
-            await self._send_raw({
-                "jsonrpc": "2.0", "id": obj["id"],
-                "error": {"code": -32601,
-                          "message": "Method not found: %s" % obj.get("method")},
-            })
-
-    # Roots the server may read without asking. Container agents say
-    # /projects/... (their mount); the host path is /home/opencode/....
-    PERM_READ_ROOTS = ("/home/opencode/projects", "/tmp/agent-shared")
-
-    def _perm_allow(self, params):
-        """Grant read-only external-directory access under the project
-        roots; deny everything else. The request title is the DIRECTORY,
-        not the tool, so the operation is inferred from rawInput shape:
-        file paths present + no execution keys (command/script/code)
-        + no write-ish title => read. Everything else denied."""
-        try:
-            call = params.get("toolCall") or {}
-            title = (call.get("title") or "").lower()
-            raw = call.get("rawInput") or {}
-            if not isinstance(raw, dict):
-                return None
-            # Execution or mutation indicators: never grant.
-            for k in list(raw.keys()):
-                kl = str(k).lower()
-                if kl in ("command", "commands", "cmd", "script", "code",
-                          "content", "text", "edits", "patch", "diff"):
-                    return None
-            for t in ("bash", "shell", "sh -", "edit", "write", "task",
-                      "todowrite", "webfetch", "websearch"):
-                if t in title:
-                    return None
-            locs = call.get("locations") or []
-            paths = [l.get("path") for l in locs
-                     if isinstance(l, dict) and l.get("path")]
-            for k in ("filepath", "parentDir", "path", "directory",
-                      "root", "cwd"):
-                v = raw.get(k)
-                if isinstance(v, str):
-                    paths.append(v)
-            if not paths:
-                return None
-            for p in paths:
-                if p == "/projects" or p.startswith("/projects/"):
-                    p = "/home/opencode/projects" + p[len("/projects"):]
-                real = os.path.realpath(p)
-                if not (real == "/home/opencode/projects" or real.startswith(
-                        "/home/opencode/projects/") or real.startswith(
-                        "/tmp/agent-shared/") or real == "/tmp/agent-shared"):
-                    return None
-            opts = params.get("options") or []
-            for opt in opts:
-                if not isinstance(opt, dict):
-                    continue
-                if (opt.get("kind") in ("allow_once", "allow_always")
-                        and opt.get("optionId")):
-                    return {"optionId": opt["optionId"]}
-            return None
-        except Exception:
-            return None
-
-    async def _answer_permission(self, obj):
-        params = obj.get("params") or {}
-        grant = self._perm_allow(params)
-        if grant is not None:
-            _log("permission granted (read-only, project roots): %s"
-                 % json.dumps(params)[:160])
-            await self._send_raw({
-                "jsonrpc": "2.0", "id": obj["id"], "result": {"outcome": {
-                    "outcome": "selected",
-                    "optionId": grant["optionId"]}},
-            })
-        else:
-            _log("permission denied: %s" % json.dumps(params)[:2000])
             await self._send_raw({
                 "jsonrpc": "2.0", "id": obj["id"],
                 "error": {"code": -32601,
@@ -490,7 +411,6 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
     # mapping's stored gen. A mismatch means the sid died with an older
     # proc: RPCs are skipped (no respawn), orphans are not recorded.
     turn_gen = None
-    allowed_ids = set()  # toolCallIds of allowlisted native reads
     last_usage_logged = 0
     # affinity: (key, delta_text, full_count). Fresh session when key unknown,
     # busy, idle, or model-mismatched server state unclear -> fall back safe.
@@ -550,7 +470,7 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
             shared = False
             sid = None
         if not shared:
-            # No MCP servers: client work uses fences; native reads may run.
+            # No MCP servers: all tool work uses client fences.
             # (MCP_BRIDGE_* kept for debugging; do not re-enable without
             # need. Server-side tools bypass client approvals.)
             resp = await acp.request("session/new",
@@ -634,7 +554,7 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                             raise AcpError("turn ended %s without content"
                                            % stop)
                         # Linger-drain: harvest frames already in flight
-                        # (final text), with a hard total cap. Non-read tool
+                        # (final text), with a hard total cap. All native tool
                         # frames stay fatal; disconnect propagates.
                         drain_end = asyncio.get_event_loop().time() + 3.0
 
@@ -656,16 +576,6 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                             if ek not in ("tool_call", "tool_call_update"):
                                 return None
                             title = frame.get("title") or "unknown"
-                            cid = frame.get("toolCallId") or ""
-                            if cid and cid in allowed_ids:
-                                return None
-                            if (isinstance(title, str)
-                                    and title.lower() in NATIVE_READ_TITLES):
-                                if cid:
-                                    allowed_ids.add(cid)
-                                _log("native read allowed: %s title=%s (drain)"
-                                     % (ek, title))
-                                return None
                             raise AcpError(
                                 "alien_tool_frame:%s: server executed "
                                 "a native tool; results never reach "
@@ -731,27 +641,7 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                             tool_active = False  # model spoke: prior tool done
                             yield ("text", content["text"])
                     elif kind in ("tool_call", "tool_call_update"):
-                        # Exact titles only on the OPENING frame; result
-                        # frames are retitled with the file path, so they
-                        # are correlated by toolCallId to the allowed call.
-                        # Anything else: cancel immediately (live bash/edit
-                        # hazard; results never reach the client anyway).
                         title = update.get("title") or "unknown"
-                        call_id = update.get("toolCallId") or ""
-                        if call_id and call_id in allowed_ids:
-                            continue
-                        if (isinstance(title, str)
-                                and title.lower() in NATIVE_READ_TITLES):
-                            if call_id:
-                                allowed_ids.add(call_id)
-                            tool_active = True
-                            _log("native read allowed: %s title=%s idle=%ds"
-                                 % (kind, title, IDLE_TIMEOUT_TOOL))
-                            if progress_cb is not None:
-                                res = progress_cb("executing native %s" % title)
-                                if res is not None:
-                                    await res
-                            continue
                         raise AcpError(
                             "alien_tool_frame:%s: server executed a native "
                             "tool; results never reach the client" % title)
