@@ -677,14 +677,26 @@ async def collect(model, prompt, stream_cb=None, log=None,
                 sug = None
                 if _forced_v:
                     sug = _forced_v  # forced tool is the answer by definition
-                elif aname.lower() in ("read", "glob", "grep", "fetch"):
-                    sug = next((n for n in offered if "read" in n.lower()),
-                               None)
-                elif aname.lower() in ("bash", "shell", "sh", "exec", "run"):
-                    sug = next((n for n in offered
-                                if any(k in n.lower() for k in
-                                       ("exec", "bash", "shell", "run",
-                                        "command"))), None)
+                else:
+                    family = aname.lower()
+                    if family in ("read", "glob", "grep", "fetch"):
+                        ranks = (("read",), ("file",), ("get",))
+                    elif family in ("bash", "shell", "sh", "exec"):
+                        ranks = (("bash",), ("shell",), ("terminal",),
+                                 ("exec",))
+                    elif family in ("task", "todo"):
+                        ranks = (("task", "todo"),)
+                    elif family in ("edit", "write"):
+                        ranks = (("edit", "write"),)
+                    else:
+                        ranks = ()
+                    best_score = 0
+                    for name in offered:
+                        score = next((len(ranks) - i
+                                      for i, keys in enumerate(ranks)
+                                      if any(k in name.lower() for k in keys)), 0)
+                        if score > best_score:
+                            sug, best_score = name, score
                 for kind, seg in sp.flush():
                     if kind == "text":
                         text_parts.append(seg)
