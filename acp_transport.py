@@ -382,6 +382,12 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
     heartbeat the client instead of sitting silent."""
     acp = _ACP
     await acp.ensure_alive()
+    turn_proc = acp.proc
+    def _live():
+        # True only while OUR process still serves: after a crash and
+        # respawn, sids died with the old proc and RPCs would only
+        # address strangers (and respawn the process just to do it).
+        return turn_proc is not None and acp.proc is turn_proc
     last_usage_logged = 0
     # affinity: (key, delta_text, full_count). Fresh session when key unknown,
     # busy, idle, or model-mismatched server state unclear -> fall back safe.
@@ -664,22 +670,26 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                         # cancel+close below own this sid; orphaning it
                         # would let a concurrent reap close it mid-turn.
                         _AFFINITY.pop(aff_key, None)
-                    try:
-                        await acp.request("session/cancel",
-                                          {"sessionId": sid}, timeout=10)
-                    except asyncio.CancelledError:
-                        _orphan(sid)
-                        raise
-                    except Exception:
-                        pass
-                    try:
-                        await acp.request("session/close", {"sessionId": sid},
-                                          timeout=10)
-                    except asyncio.CancelledError:
-                        _orphan(sid)
-                        raise
-                    except Exception:
-                        _orphan(sid)  # close failed: let the reaper retry
+                    if not _live():
+                        pass  # serving proc gone with the session: no RPCs
+                    else:
+                        try:
+                            await acp.request("session/cancel",
+                                              {"sessionId": sid}, timeout=10)
+                        except asyncio.CancelledError:
+                            _orphan(sid)
+                            raise
+                        except Exception:
+                            pass
+                    if _live():
+                        try:
+                            await acp.request("session/close",
+                                              {"sessionId": sid}, timeout=10)
+                        except asyncio.CancelledError:
+                            _orphan(sid)
+                            raise
+                        except Exception:
+                            _orphan(sid)  # close failed: reaper retries
                 elif aff_key is not None and mark_sent(
                         aff_key, sid, aff_count, model, aff_store):
                     # Healthy turn, mapping kept: session lives on.
@@ -688,14 +698,17 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                     # No key, or the key is owned by a live twin turn:
                     # one-shot close, no mapping.
                     kept = False
-                    try:
-                        await acp.request("session/close", {"sessionId": sid},
-                                          timeout=10)
-                    except asyncio.CancelledError:
-                        _orphan(sid)
-                        raise
-                    except Exception:
-                        pass
+                    if not _live():
+                        pass  # serving proc gone with the session
+                    else:
+                        try:
+                            await acp.request("session/close",
+                                              {"sessionId": sid}, timeout=10)
+                        except asyncio.CancelledError:
+                            _orphan(sid)
+                            raise
+                        except Exception:
+                            pass
         finally:
             if aff_entry is not None:
                 aff_entry["busy"] = False
