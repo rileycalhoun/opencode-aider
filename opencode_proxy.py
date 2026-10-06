@@ -706,12 +706,27 @@ async def collect(model, prompt, stream_cb=None, log=None,
                 guide = ("\n[shim: blocked native `%s` -- not permitted "
                          "here; this turn was stopped. " % aname)
                 if sug:
-                    guide += ("To do this, emit ONLY the fenced <tool_call> "
+                    guide += ("In the next model turn, emit ONLY the fenced <tool_call> "
                               "block using the `%s` client tool.]\n" % sug)
                 else:
-                    guide += ("Choose an appropriate listed client tool "
+                    guide += ("In the next model turn, choose an appropriate listed client tool "
                               "with a fenced <tool_call> block, or answer "
                               "in plain prose.]\n")
+                # AiderDesk ends on assistant text + stop (agent.ts:1314).
+                # Give the model one fresh corrective turn inside this request;
+                # never manufacture a call or impersonate a client tool result.
+                if (offered and not corrected and attempt < 2
+                        and time.monotonic() < deadline - 30):
+                    prompt += ("\n\n[system]\n" + guide.strip()
+                               + "\nContinue with a fenced call. Choose arguments "
+                               "from the user's request and the listed schema; "
+                               "no native tools. The blocked attempt produced "
+                               "no usable tool result.")
+                    corrected = True
+                    if log:
+                        log("alien correction (%d): %s -> %s; fresh retry"
+                            % (strikes, aname, sug or "listed tools"))
+                    continue
                 text_parts.append(guide)
                 note_text()
                 if stream_cb:
