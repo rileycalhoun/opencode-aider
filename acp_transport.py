@@ -657,7 +657,10 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                     prompt_task.cancel()
                     if shared and (_AFFINITY.get(aff_key) or {}).get(
                             "sid") == sid:
-                        drop_affinity(aff_key)
+                        # Plain pop (not drop_affinity): the inline
+                        # cancel+close below own this sid; orphaning it
+                        # would let a concurrent reap close it mid-turn.
+                        _AFFINITY.pop(aff_key, None)
                     try:
                         await acp.request("session/cancel",
                                           {"sessionId": sid}, timeout=10)
