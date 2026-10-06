@@ -426,6 +426,15 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
     died = False  # process died after a complete answer (keep text)
     kept = False  # True only when a mapping is kept
     try:
+        if shared and not (aff_delta or "").strip():
+            # Raced idle entry with nothing new: full text into a live
+            # session would duplicate context. Drop it; the fresh
+            # branch below creates a real new session.
+            _orphan(aff_entry["sid"])
+            drop_affinity(aff_key)
+            aff_entry = None
+            shared = False
+            sid = None
         if not shared:
             # No MCP servers, ever: only fenced client tools exist here.
             # (MCP_BRIDGE_* kept for debugging; do not re-enable without
@@ -439,14 +448,6 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
         else:
             _log("affinity hit %s: delta %dch (saved full resend)"
                  % (aff_key, len(aff_delta or "")))
-            if not (aff_delta or "").strip():
-                # Raced idle entry with nothing new: full text into a
-                # live session would duplicate context. Go fresh now,
-                # before set_config touches the old sid.
-                _orphan(aff_entry["sid"])
-                drop_affinity(aff_key)
-                aff_entry = None
-                shared = False
         try:
             # Register the queue FIRST: frames arriving between session/new
             # and set_config had nowhere to land (the 2/turn unknown-session
@@ -545,10 +546,7 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                                 "the client" % title)
 
                         if pending_get.done() and not pending_get.cancelled():
-                            try:
-                                frame0 = pending_get.result()
-                            except asyncio.CancelledError:
-                                raise
+                            frame0 = pending_get.result()
                             if (isinstance(frame0, dict)
                                     and frame0.get("__acp_dead__")):
                                 died = True
@@ -642,10 +640,10 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                     pending_get.cancel()
                 if died:
                     # Process died after a complete answer: nothing to
-                    # cancel or close server-side. Drop mapping, forget.
-                    if shared and (_AFFINITY.get(aff_key) or {}).get(
-                            "sid") == sid:
-                        drop_affinity(aff_key)
+                    # cancel or close server-side (close would respawn
+                    # the process just to address a dead sid). Pop the
+                    # mapping without orphaning; forget the queue.
+                    _AFFINITY.pop(aff_key, None) if shared else None
                     acp.forget_session(sid)
                 elif abnormal:
                     # Abnormal exit: tell the server to STOP WORK.
