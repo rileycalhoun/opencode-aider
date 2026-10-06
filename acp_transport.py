@@ -236,8 +236,13 @@ class AcpProcess:
                           "message": "Method not found: %s" % obj.get("method")},
             })
 
-    async def _send_raw(self, obj):
+    async def _send_raw(self, obj, expect_gen=None):
         async with self._write_lock:
+            if expect_gen is not None and (
+                    expect_gen != self._gen or self.proc is None
+                    or self.proc.returncode is not None):
+                raise AcpError("stale generation %s (current %s): send skipped"
+                               % (expect_gen, self._gen))
             self.proc.stdin.write((json.dumps(obj) + "\n").encode())
             await self.proc.stdin.drain()
 
@@ -263,7 +268,8 @@ class AcpProcess:
         try:
             await asyncio.wait_for(
                 self._send_raw({"jsonrpc": "2.0", "id": mid,
-                                "method": method, "params": params}),
+                                "method": method, "params": params},
+                               expect_gen=expect_gen),
                 timeout=30)
             return await asyncio.wait_for(fut, timeout)
         finally:
