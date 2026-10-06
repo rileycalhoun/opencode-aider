@@ -423,6 +423,7 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
     sid = aff_entry["sid"] if shared else None
     ok = True
     abnormal = True  # safe default: early failure forgets session state
+    died = False  # process died after a complete answer (keep text)
     kept = False  # True only when a mapping is kept
     try:
         if not shared:
@@ -438,6 +439,14 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
         else:
             _log("affinity hit %s: delta %dch (saved full resend)"
                  % (aff_key, len(aff_delta or "")))
+            if not (aff_delta or "").strip():
+                # Raced idle entry with nothing new: full text into a
+                # live session would duplicate context. Go fresh now,
+                # before set_config touches the old sid.
+                _orphan(aff_entry["sid"])
+                drop_affinity(aff_key)
+                aff_entry = None
+                shared = False
         try:
             # Register the queue FIRST: frames arriving between session/new
             # and set_config had nowhere to land (the 2/turn unknown-session
@@ -465,25 +474,6 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
             send_text = prompt_text
             if shared and aff_delta:
                 send_text = aff_delta  # follow-up: only what's new
-            elif shared:
-                # Raced entry (busy at peek, idle now) with nothing new:
-                # full text into a live session would duplicate context.
-                _orphan(aff_entry["sid"])
-                drop_affinity(aff_key)
-                aff_entry = None
-                shared = False
-                sid = None
-                resp = await acp.request("session/new",
-                                         {"cwd": workdir, "mcpServers": []})
-                sid = (resp.get("result") or {}).get("sessionId")
-                if not sid:
-                    raise AcpError("session/new gave no sessionId: %s"
-                                   % json.dumps(resp)[:200])
-                updates = acp.session_queue(sid)
-                await acp.request("session/set_config_option",
-                                  {"sessionId": sid, "configId": "model",
-                                   "value": "opencode/" + model})
-                send_text = prompt_text
             prompt_task = asyncio.ensure_future(acp.request(
                 "session/prompt",
                 {"sessionId": sid, "prompt": [
@@ -556,7 +546,15 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
 
                         if pending_get.done() and not pending_get.cancelled():
                             try:
-                                t = await _drain_text(pending_get.result())
+                                frame0 = pending_get.result()
+                            except asyncio.CancelledError:
+                                raise
+                            if (isinstance(frame0, dict)
+                                    and frame0.get("__acp_dead__")):
+                                died = True
+                                break
+                            try:
+                                t = await _drain_text(frame0)
                             except asyncio.CancelledError:
                                 raise
                             if t:
@@ -564,7 +562,8 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                         else:
                             if not pending_get.done():
                                 pending_get.cancel()
-                        died = False
+                        died = False  # process died post-answer:
+                                        # keep text, no retry, drop mapping
                         try:
                             while (asyncio.get_event_loop().time()
                                    < drain_end):
@@ -641,7 +640,14 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
             finally:
                 if not pending_get.done():
                     pending_get.cancel()
-                if abnormal:
+                if died:
+                    # Process died after a complete answer: nothing to
+                    # cancel or close server-side. Drop mapping, forget.
+                    if shared and (_AFFINITY.get(aff_key) or {}).get(
+                            "sid") == sid:
+                        drop_affinity(aff_key)
+                    acp.forget_session(sid)
+                elif abnormal:
                     # Abnormal exit: tell the server to STOP WORK.
                     prompt_task.cancel()
                     try:
@@ -649,11 +655,6 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                                           {"sessionId": sid}, timeout=10)
                     except asyncio.CancelledError:
                         _orphan(sid)
-                        try:
-                            await acp.request("session/close",
-                                              {"sessionId": sid}, timeout=10)
-                        except Exception:
-                            pass
                         raise
                     except Exception:
                         pass
