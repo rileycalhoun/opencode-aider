@@ -651,9 +651,13 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                     acp.forget_session(sid)
                 elif abnormal:
                     # Abnormal exit: tell the server to STOP WORK, then
-                    # close so poison never lingers -- but only drop a
-                    # mapping that is still ours.
+                    # close so poison never lingers. Drop our mapping
+                    # FIRST so a cancel mid-cancel can't leave a
+                    # published entry pointing at an orphaned sid.
                     prompt_task.cancel()
+                    if shared and (_AFFINITY.get(aff_key) or {}).get(
+                            "sid") == sid:
+                        drop_affinity(aff_key)
                     try:
                         await acp.request("session/cancel",
                                           {"sessionId": sid}, timeout=10)
@@ -662,9 +666,6 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                         raise
                     except Exception:
                         pass
-                    if shared and (_AFFINITY.get(aff_key) or {}).get(
-                            "sid") == sid:
-                        drop_affinity(aff_key)
                     try:
                         await acp.request("session/close", {"sessionId": sid},
                                           timeout=10)
