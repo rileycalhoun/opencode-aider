@@ -650,7 +650,9 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                             _AFFINITY.pop(aff_key, None)
                     acp.forget_session(sid)
                 elif abnormal:
-                    # Abnormal exit: tell the server to STOP WORK.
+                    # Abnormal exit: tell the server to STOP WORK, then
+                    # close so poison never lingers -- but only drop a
+                    # mapping that is still ours.
                     prompt_task.cancel()
                     try:
                         await acp.request("session/cancel",
@@ -660,11 +662,6 @@ async def acp_turn_events(model, prompt_text, workdir=ACP_HOME,
                         raise
                     except Exception:
                         pass
-                if abnormal and not died:
-                    # Failed turn: poison would linger server-side. Close and
-                    # forget so the next turn starts clean -- but only if the
-                    # mapping is still ours (a concurrent fallback may have
-                    # published a replacement).
                     if shared and (_AFFINITY.get(aff_key) or {}).get(
                             "sid") == sid:
                         drop_affinity(aff_key)
