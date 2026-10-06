@@ -366,6 +366,9 @@ async def reap_orphans(acp, limit=2):
 
 def clear_affinity():
     _AFFINITY.clear()
+    del _AFF_ORPHANS[:]  # dead sids die with the proc; don't close them
+    for _k in list(_AFF_USE):
+        _AFF_USE.pop(_k, None)
 
 
 _ACP = AcpProcess()
